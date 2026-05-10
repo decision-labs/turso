@@ -21,7 +21,9 @@
 //! - Row-count estimates from `sqlite_stat1` in `best_index` are not wired (static `best_index` has no table handle).
 //! - Internal-node overflow / `SplitNode` recursion as in `rtreeInsertCell` is not needed for the current
 //!   in-place leaf split strategy (parent fanout stays bounded); a full port would be required if that changes.
-//! - Delete of the last entry in a subtree does not run SQLite’s full `removeNode` / tree-condense path.
+//! - Root collapse when the root has exactly one child (`rtreeDeleteRowid` in `rtree.c`) is not implemented.
+//! - When an **internal** node is underfull (`iHeight > 0`), SQLite removes and reinserts subtree
+//!   pointers (`ChooseLeaf` / `rtreeInsertCell` at height); we only tighten bounding boxes.
 
 use std::sync::Arc;
 use turso_ext::{
@@ -191,6 +193,11 @@ struct RtreeTable {
 impl RtreeTable {
     fn max_cells(&self) -> usize {
         (self.node_size - 4) / self.n_bytes_per_cell
+    }
+
+    /// Matches `RTREE_MINCELLS` in SQLite `ext/rtree/rtree.c`.
+    fn min_cells(&self) -> usize {
+        self.max_cells() / 3
     }
 
     fn shadow_node_table(&self) -> String {
@@ -390,6 +397,202 @@ impl RtreeTable {
         let sql = format!("DELETE FROM {} WHERE rowid = ?", self.shadow_rowid_table());
         conn.execute(&sql, &[Value::from_integer(rowid)])
             .map_err(|_| ResultCode::Error)?;
+        Ok(())
+    }
+
+    fn delete_shadow_node_row(&self, conn: &Arc<Connection>, nodeno: i64) -> Result<(), ResultCode> {
+        let sql = format!("DELETE FROM {} WHERE nodeno = ?", self.shadow_node_table());
+        conn.execute(&sql, &[Value::from_integer(nodeno)])
+            .map_err(|_| ResultCode::Error)?;
+        Ok(())
+    }
+
+    fn delete_shadow_parent_row(&self, conn: &Arc<Connection>, nodeno: i64) -> Result<(), ResultCode> {
+        let sql = format!("DELETE FROM {} WHERE nodeno = ?", self.shadow_parent_table());
+        conn.execute(&sql, &[Value::from_integer(nodeno)])
+            .map_err(|_| ResultCode::Error)?;
+        Ok(())
+    }
+
+    fn read_rowid_aux_values(
+        &self,
+        conn: &Arc<Connection>,
+        rowid: i64,
+    ) -> Result<Vec<Value>, ResultCode> {
+        if self.aux_columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cols = self
+            .aux_columns
+            .iter()
+            .map(|n| quote_sql_ident(n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {} FROM {} WHERE rowid = ?",
+            cols,
+            self.shadow_rowid_table()
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|_| ResultCode::Error)?;
+        stmt.bind_at(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            Value::from_integer(rowid),
+        );
+        if stmt.step() == StepResult::Row {
+            let row = stmt.get_row();
+            if row.len() < self.aux_columns.len() {
+                return Err(ResultCode::Corrupt);
+            }
+            let mut out = Vec::with_capacity(self.aux_columns.len());
+            for i in 0..self.aux_columns.len() {
+                out.push(value_to_owned(&row[i]));
+            }
+            return Ok(out);
+        }
+        Err(ResultCode::NotFound)
+    }
+
+    /// Insert one leaf row (coordinates + aux) at `rowid`, matching the body of [`VTable::insert`].
+    fn insert_leaf_row(
+        &mut self,
+        conn: &Arc<Connection>,
+        rowid: i64,
+        cell: &RtreeCell,
+        aux: &[Value],
+    ) -> Result<(), ResultCode> {
+        if aux.len() != self.aux_columns.len() {
+            return Err(ResultCode::InvalidArgs);
+        }
+        self.row_count = self.row_count.max(rowid);
+
+        if self.node_count == 0 {
+            self.create_shadow_tables(conn)?;
+        }
+
+        let leaf_opt = choose_leaf(self, Some(conn), cell, self.n_dim2);
+        let leaf_nodeno = if let Some(mut leaf) = leaf_opt {
+            let n_cells = leaf.cell_count();
+            let max_cells = self.max_cells();
+            let nodeno = leaf.node_no;
+
+            if n_cells < max_cells {
+                leaf.set_cell(self.n_dim2, self.n_bytes_per_cell, n_cells, cell);
+                leaf.set_cell_count(n_cells + 1);
+                self.write_node(conn, nodeno, &leaf)?;
+                nodeno
+            } else {
+                let n_total = n_cells + 1;
+                let mid = (n_total + 1) / 2;
+                let new_idx = n_total - 1;
+                let (left, right) = split_node(self, &leaf, cell, self.n_dim2);
+                self.node_count += 2;
+                let left_no = self.node_count - 1;
+                let right_no = self.node_count;
+                self.write_node(conn, left_no, &left)?;
+                self.write_node(conn, right_no, &right)?;
+                self.write_parent_map(conn, left_no, nodeno)?;
+                self.write_parent_map(conn, right_no, nodeno)?;
+
+                let cell_left = bounding_cell_for_child_node(self, &left, left_no, self.n_dim2);
+                let cell_right = bounding_cell_for_child_node(self, &right, right_no, self.n_dim2);
+                leaf.set_cell(self.n_dim2, self.n_bytes_per_cell, 0, &cell_left);
+                leaf.set_cell(self.n_dim2, self.n_bytes_per_cell, 1, &cell_right);
+                leaf.set_cell_count(2);
+                if nodeno == 1 {
+                    leaf.set_depth(leaf.tree_depth() + 1);
+                }
+                self.write_node(conn, nodeno, &leaf)?;
+                if new_idx < mid {
+                    left_no
+                } else {
+                    right_no
+                }
+            }
+        } else {
+            self.node_count += 1;
+            let new_node_no = self.node_count;
+            let mut new_node = RtreeNode::new(new_node_no, 0, self.node_size);
+            new_node.set_cell(self.n_dim2, self.n_bytes_per_cell, 0, cell);
+            new_node.set_cell_count(1);
+            self.write_node(conn, new_node_no, &new_node)?;
+            self.depth = 1;
+            new_node_no
+        };
+
+        self.adjust_ancestry_mbr(conn, leaf_nodeno)?;
+        self.write_rowid_map(conn, rowid, leaf_nodeno, aux)?;
+        Ok(())
+    }
+
+    /// After removing a cell, enforce SQLite-style minimum fill (`RTREE_MINCELLS`): detach underfull
+    /// nodes, then queue leaf cells for reinsert (see `removeNode` / `reinsertNodeContent` in `rtree.c`).
+    fn fix_after_cell_removal(
+        &mut self,
+        conn: &Arc<Connection>,
+        nodeno: i64,
+        height: usize,
+        pending: &mut Vec<(Vec<RtreeCell>, usize)>,
+        depth_guard: &mut usize,
+    ) -> Result<(), ResultCode> {
+        *depth_guard += 1;
+        if *depth_guard > 500 {
+            return Err(ResultCode::Corrupt);
+        }
+
+        let min_c = self.min_cells();
+        let Some(mut node) = self.read_node(conn, nodeno)? else {
+            return Ok(());
+        };
+        let n = node.cell_count();
+
+        if nodeno == 1 && n == 0 {
+            node.set_cell_count(0);
+            node.set_depth(0);
+            self.write_node(conn, 1, &node)?;
+            self.depth = 0;
+            return Ok(());
+        }
+
+        if n >= min_c {
+            if n > 0 {
+                self.tighten_ancestry_mbr(conn, nodeno)?;
+            }
+            return Ok(());
+        }
+
+        if nodeno == 1 {
+            return Ok(());
+        }
+
+        if height > 0 {
+            if n > 0 {
+                self.tighten_ancestry_mbr(conn, nodeno)?;
+            }
+            return Ok(());
+        }
+
+        let cells: Vec<RtreeCell> = (0..n)
+            .map(|i| node.get_cell(self.n_dim2, self.n_bytes_per_cell, i))
+            .collect();
+
+        let parent_no = self
+            .get_parent_nodeno(conn, nodeno)?
+            .ok_or(ResultCode::Corrupt)?;
+        let mut parent = self
+            .read_node(conn, parent_no)?
+            .ok_or(ResultCode::Corrupt)?;
+        let idx = self
+            .find_cell_index(&parent, nodeno)
+            .ok_or(ResultCode::Corrupt)?;
+        self.delete_cell_from_node(&mut parent, idx);
+        self.write_node(conn, parent_no, &parent)?;
+
+        self.fix_after_cell_removal(conn, parent_no, height + 1, pending, depth_guard)?;
+
+        self.delete_shadow_node_row(conn, nodeno)?;
+        self.delete_shadow_parent_row(conn, nodeno)?;
+
+        pending.push((cells, height));
         Ok(())
     }
 
@@ -1187,66 +1390,8 @@ impl VTable for RtreeTable {
             }
         }
 
-        if self.node_count == 0 {
-            self.create_shadow_tables(&conn)?;
-        }
-
-        let leaf_opt = choose_leaf(self, Some(&conn), &cell, self.n_dim2);
-        let leaf_nodeno = if let Some(mut leaf) = leaf_opt {
-            let n_cells = leaf.cell_count();
-            let max_cells = self.max_cells();
-            let nodeno = leaf.node_no;
-
-            if n_cells < max_cells {
-                leaf.set_cell(self.n_dim2, self.n_bytes_per_cell, n_cells, &cell);
-                leaf.set_cell_count(n_cells + 1);
-                self.write_node(&conn, nodeno, &leaf)?;
-                nodeno
-            } else {
-                let n_total = n_cells + 1;
-                let mid = (n_total + 1) / 2;
-                let new_idx = n_total - 1;
-                let (left, right) = split_node(self, &leaf, &cell, self.n_dim2);
-                self.node_count += 2;
-                let left_no = self.node_count - 1;
-                let right_no = self.node_count;
-                self.write_node(&conn, left_no, &left)?;
-                self.write_node(&conn, right_no, &right)?;
-                // `%_parent`: both new nodes are children of the split node (`nodeno`).
-                self.write_parent_map(&conn, left_no, nodeno)?;
-                self.write_parent_map(&conn, right_no, nodeno)?;
-
-                let cell_left = bounding_cell_for_child_node(self, &left, left_no, self.n_dim2);
-                let cell_right = bounding_cell_for_child_node(self, &right, right_no, self.n_dim2);
-                leaf.set_cell(self.n_dim2, self.n_bytes_per_cell, 0, &cell_left);
-                leaf.set_cell(self.n_dim2, self.n_bytes_per_cell, 1, &cell_right);
-                leaf.set_cell_count(2);
-                // Tree depth lives only on root blob (`nodeno == 1`); see `RtreeNode::set_depth`.
-                if nodeno == 1 {
-                    leaf.set_depth(leaf.tree_depth() + 1);
-                }
-                self.write_node(&conn, nodeno, &leaf)?;
-                if new_idx < mid {
-                    left_no
-                } else {
-                    right_no
-                }
-            }
-        } else {
-            self.node_count += 1;
-            let new_node_no = self.node_count;
-            let mut new_node = RtreeNode::new(new_node_no, 0, self.node_size);
-            new_node.set_cell(self.n_dim2, self.n_bytes_per_cell, 0, &cell);
-            new_node.set_cell_count(1);
-            self.write_node(&conn, new_node_no, &new_node)?;
-            self.depth = 1;
-            new_node_no
-        };
-
-        self.adjust_ancestry_mbr(&conn, leaf_nodeno)?;
-
         let aux = &args[self.n_dim2 + 1..required];
-        self.write_rowid_map(&conn, rowid, leaf_nodeno, aux)?;
+        self.insert_leaf_row(&conn, rowid, &cell, aux)?;
 
         Ok(rowid)
     }
@@ -1260,8 +1405,28 @@ impl VTable for RtreeTable {
                 if let Some(cell_idx) = self.find_cell_index(&node, rowid) {
                     self.delete_cell_from_node(&mut node, cell_idx);
                     self.write_node(&conn, nodeno, &node)?;
-                    if node.cell_count() > 0 {
-                        self.tighten_ancestry_mbr(&conn, nodeno)?;
+
+                    let mut pending = Vec::new();
+                    let mut depth_guard = 0;
+                    self.fix_after_cell_removal(
+                        &conn,
+                        nodeno,
+                        0,
+                        &mut pending,
+                        &mut depth_guard,
+                    )?;
+
+                    for (cells, _h) in pending {
+                        for c in cells {
+                            let aux = match self.read_rowid_aux_values(&conn, c.rowid) {
+                                Ok(a) => a,
+                                Err(ResultCode::NotFound) => {
+                                    vec![Value::null(); self.aux_columns.len()]
+                                }
+                                Err(e) => return Err(e),
+                            };
+                            self.insert_leaf_row(&conn, c.rowid, &c, &aux)?;
+                        }
                     }
                 }
             }
@@ -1695,6 +1860,7 @@ mod tests {
         ]);
         let max_cells = table.max_cells();
         assert!(max_cells > 0);
+        assert_eq!(table.min_cells(), max_cells / 3);
     }
 
     #[test]
