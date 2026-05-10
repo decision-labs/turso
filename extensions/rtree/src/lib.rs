@@ -402,6 +402,77 @@ impl RtreeTable {
         Ok(())
     }
 
+    fn get_parent_nodeno(
+        &self,
+        conn: &Arc<Connection>,
+        nodeno: i64,
+    ) -> Result<Option<i64>, ResultCode> {
+        if nodeno <= 1 {
+            return Ok(None);
+        }
+        let sql = format!(
+            "SELECT parentnode FROM {} WHERE nodeno = ?",
+            self.shadow_parent_table()
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|_| ResultCode::Error)?;
+        stmt.bind_at(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            Value::from_integer(nodeno),
+        );
+        if stmt.step() == StepResult::Row {
+            let row = stmt.get_row();
+            if let Some(val) = row.first() {
+                return Ok(val.to_integer());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Walk `%_parent` toward the root and expand each ancestor cell so it covers the child's
+    /// tight MBR (SQLite `AdjustTree` in `ext/rtree/rtree.c`).
+    ///
+    /// Note: SQLite also splits **internal** nodes when `nodeInsertCell` overflows (`SplitNode`);
+    /// our insert path keeps parent fanout stable by converting full leaves in place; internal
+    /// splits would be needed if we inserted sibling pointers into parents without that invariant.
+    fn adjust_ancestry_mbr(
+        &self,
+        conn: &Arc<Connection>,
+        mut nodeno: i64,
+    ) -> Result<(), ResultCode> {
+        let mut hops = 0;
+        loop {
+            if hops > 100 {
+                return Err(ResultCode::Error);
+            }
+            hops += 1;
+
+            let Some(node) = self.read_node(conn, nodeno)? else {
+                break;
+            };
+            let Some(agg) = union_mbr_of_node_cells(self, &node, self.n_dim2) else {
+                break;
+            };
+            let Some(parent_no) = self.get_parent_nodeno(conn, nodeno)? else {
+                break;
+            };
+            let Some(mut parent_node) = self.read_node(conn, parent_no)? else {
+                return Err(ResultCode::Error);
+            };
+            let Some(idx) = self.find_cell_index(&parent_node, nodeno) else {
+                return Err(ResultCode::Error);
+            };
+            let mut pc = parent_node.get_cell(self.n_dim2, self.n_bytes_per_cell, idx);
+            if !cell_contains_mbr(&pc, &agg, self.n_dim2) {
+                let merged = cell_union_mbr_coords(&pc, &agg, self.n_dim2);
+                pc.coords = merged.coords;
+                parent_node.set_cell(self.n_dim2, self.n_bytes_per_cell, idx, &pc);
+                self.write_node(conn, parent_no, &parent_node)?;
+            }
+            nodeno = parent_no;
+        }
+        Ok(())
+    }
+
     fn find_cell_index(&self, node: &RtreeNode, rowid: i64) -> Option<usize> {
         let n_cells = node.cell_count();
         for i in 0..n_cells {
@@ -945,6 +1016,49 @@ fn bounding_cell_for_child_node(
     out
 }
 
+/// Axis-aligned union of two bounding boxes (`coords[2*d]` min, `coords[2*d+1]` max per dimension).
+fn cell_union_mbr_coords(a: &RtreeCell, b: &RtreeCell, n_dim2: usize) -> RtreeCell {
+    let n_dim = n_dim2 / 2;
+    let mut out = RtreeCell::new(a.rowid);
+    for j in 0..n_dim {
+        out.coords[2 * j] = a.coords[2 * j].min(b.coords[2 * j]);
+        out.coords[2 * j + 1] = a.coords[2 * j + 1].max(b.coords[2 * j + 1]);
+    }
+    out
+}
+
+/// True if `outer` fully contains `inner` in every dimension (SQLite `cellContains`).
+fn cell_contains_mbr(outer: &RtreeCell, inner: &RtreeCell, n_dim2: usize) -> bool {
+    let n_dim = n_dim2 / 2;
+    for j in 0..n_dim {
+        let o_lo = outer.coords[2 * j];
+        let o_hi = outer.coords[2 * j + 1];
+        let i_lo = inner.coords[2 * j];
+        let i_hi = inner.coords[2 * j + 1];
+        if i_lo < o_lo || i_hi > o_hi {
+            return false;
+        }
+    }
+    true
+}
+
+fn union_mbr_of_node_cells(
+    table: &RtreeTable,
+    node: &RtreeNode,
+    n_dim2: usize,
+) -> Option<RtreeCell> {
+    let n = node.cell_count();
+    if n == 0 {
+        return None;
+    }
+    let mut acc = node.get_cell(n_dim2, table.n_bytes_per_cell, 0);
+    for i in 1..n {
+        let c = node.get_cell(n_dim2, table.n_bytes_per_cell, i);
+        acc = cell_union_mbr_coords(&acc, &c, n_dim2);
+    }
+    Some(acc)
+}
+
 impl VTable for RtreeTable {
     type Cursor = RtreeCursor;
     type Error = ResultCode;
@@ -1032,10 +1146,8 @@ impl VTable for RtreeTable {
                 self.write_parent_map(&conn, left_no, nodeno)?;
                 self.write_parent_map(&conn, right_no, nodeno)?;
 
-                let cell_left =
-                    bounding_cell_for_child_node(self, &left, left_no, self.n_dim2);
-                let cell_right =
-                    bounding_cell_for_child_node(self, &right, right_no, self.n_dim2);
+                let cell_left = bounding_cell_for_child_node(self, &left, left_no, self.n_dim2);
+                let cell_right = bounding_cell_for_child_node(self, &right, right_no, self.n_dim2);
                 leaf.set_cell(self.n_dim2, self.n_bytes_per_cell, 0, &cell_left);
                 leaf.set_cell(self.n_dim2, self.n_bytes_per_cell, 1, &cell_right);
                 leaf.set_cell_count(2);
@@ -1060,6 +1172,8 @@ impl VTable for RtreeTable {
             self.depth = 1;
             new_node_no
         };
+
+        self.adjust_ancestry_mbr(&conn, leaf_nodeno)?;
 
         let aux = &args[self.n_dim2 + 1..required];
         self.write_rowid_map(&conn, rowid, leaf_nodeno, aux)?;
@@ -1627,6 +1741,30 @@ mod tests {
         let (left, right) = split_node(&table, &node, &cell, 4);
 
         assert!(left.cell_count() > 0 || right.cell_count() > 0);
+    }
+
+    #[test]
+    fn test_cell_union_and_contains_mbr() {
+        let mut a = RtreeCell::new(1);
+        a.coords[0] = 0.0;
+        a.coords[1] = 2.0;
+        a.coords[2] = 1.0;
+        a.coords[3] = 3.0;
+
+        let mut b = RtreeCell::new(2);
+        b.coords[0] = 1.0;
+        b.coords[1] = 5.0;
+        b.coords[2] = 0.0;
+        b.coords[3] = 2.0;
+
+        let u = cell_union_mbr_coords(&a, &b, 4);
+        assert!((u.coords[0] - 0.0).abs() < 1e-5);
+        assert!((u.coords[1] - 5.0).abs() < 1e-5);
+        assert!((u.coords[2] - 0.0).abs() < 1e-5);
+        assert!((u.coords[3] - 3.0).abs() < 1e-5);
+
+        assert!(cell_contains_mbr(&u, &a, 4));
+        assert!(cell_contains_mbr(&u, &b, 4));
     }
 
     #[test]
