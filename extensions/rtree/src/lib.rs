@@ -21,7 +21,9 @@
 //! - Row-count estimates from `sqlite_stat1` in `best_index` are not wired (static `best_index` has no table handle).
 //! - Internal-node overflow / `SplitNode` recursion as in `rtreeInsertCell` is not needed for the current
 //!   in-place leaf split strategy (parent fanout stays bounded); a full port would be required if that changes.
-//! - Root collapse when the root has exactly one child (`rtreeDeleteRowid` in `rtree.c`) is not implemented.
+//! - Root collapse when the root has exactly one child (`rtreeDeleteRowid` in `rtree.c`) is implemented only for the
+//!   **two-level** tree (`tree_depth == 2` on the root blob, i.e. one internal level above leaves). Deeper trees still
+//!   need `ChooseLeaf`/`rtreeInsertCell` at `iHeight > 0` for reinsert.
 //! - When an **internal** node is underfull (`iHeight > 0`), SQLite removes and reinserts subtree
 //!   pointers (`ChooseLeaf` / `rtreeInsertCell` at height); we only tighten bounding boxes.
 
@@ -593,6 +595,52 @@ impl RtreeTable {
         self.delete_shadow_parent_row(conn, nodeno)?;
 
         pending.push((cells, height));
+        Ok(())
+    }
+
+    /// If the root has exactly one subtree after deletes (`rtreeDeleteRowid` in `rtree.c`, ~2978–3000), detach that
+    /// child, drop its shadow rows, lower the stored depth, and queue its cells for reinsert.
+    ///
+    /// We only handle the case **`tree_depth == 2`** (one level of internal nodes above leaves), so queued cells are
+    /// always leaf rows (`height == 0`). Taller trees require internal-node reinsert.
+    fn maybe_collapse_root_single_child(
+        &mut self,
+        conn: &Arc<Connection>,
+        pending: &mut Vec<(Vec<RtreeCell>, usize)>,
+    ) -> Result<(), ResultCode> {
+        let Some(mut root) = self.read_node(conn, 1)? else {
+            return Ok(());
+        };
+        let r = root.tree_depth();
+        // Align with SQLite `iDepth > 0 && NCELL(pRoot)==1`: estimate SQLite depth as r - 1 (see ChooseLeaf descent).
+        let sqlite_depth = r.saturating_sub(1);
+        if sqlite_depth == 0 || root.cell_count() != 1 || r != 2 {
+            return Ok(());
+        }
+
+        let child_no = root
+            .get_cell(self.n_dim2, self.n_bytes_per_cell, 0)
+            .rowid;
+        let Some(child) = self.read_node(conn, child_no)? else {
+            return Err(ResultCode::Corrupt);
+        };
+
+        let n = child.cell_count();
+        let cells: Vec<RtreeCell> = (0..n)
+            .map(|i| child.get_cell(self.n_dim2, self.n_bytes_per_cell, i))
+            .collect();
+
+        root.set_cell_count(0);
+        // After collapse SQLite sets `iDepth--`. With root blob depth `R ≈ iDepth + 1`, new `R' = iDepth` (pre-collapse).
+        root.set_depth(sqlite_depth);
+        self.write_node(conn, 1, &root)?;
+        self.depth = root.tree_depth();
+
+        self.delete_shadow_node_row(conn, child_no)?;
+        self.delete_shadow_parent_row(conn, child_no)?;
+
+        let reinsert_height = sqlite_depth.saturating_sub(1);
+        pending.push((cells, reinsert_height));
         Ok(())
     }
 
@@ -1400,13 +1448,13 @@ impl VTable for RtreeTable {
         let Some(conn) = conn else {
             return Err(ResultCode::InvalidArgs);
         };
+        let mut pending = Vec::new();
         if let Some(nodeno) = self.get_rowid_nodeno(&conn, rowid)? {
             if let Some(mut node) = self.read_node(&conn, nodeno)? {
                 if let Some(cell_idx) = self.find_cell_index(&node, rowid) {
                     self.delete_cell_from_node(&mut node, cell_idx);
                     self.write_node(&conn, nodeno, &node)?;
 
-                    let mut pending = Vec::new();
                     let mut depth_guard = 0;
                     self.fix_after_cell_removal(
                         &conn,
@@ -1415,23 +1463,26 @@ impl VTable for RtreeTable {
                         &mut pending,
                         &mut depth_guard,
                     )?;
-
-                    for (cells, _h) in pending {
-                        for c in cells {
-                            let aux = match self.read_rowid_aux_values(&conn, c.rowid) {
-                                Ok(a) => a,
-                                Err(ResultCode::NotFound) => {
-                                    vec![Value::null(); self.aux_columns.len()]
-                                }
-                                Err(e) => return Err(e),
-                            };
-                            self.insert_leaf_row(&conn, c.rowid, &c, &aux)?;
-                        }
-                    }
                 }
             }
         }
+        // Mirror `rtreeDeleteRowid`: rowid shadow delete, then optional root collapse, then reinsert.
         self.delete_rowid_map(&conn, rowid)?;
+        self.maybe_collapse_root_single_child(&conn, &mut pending)?;
+
+        for (cells, h) in pending {
+            if h != 0 {
+                return Err(ResultCode::Unimplemented);
+            }
+            for c in cells {
+                let aux = match self.read_rowid_aux_values(&conn, c.rowid) {
+                    Ok(a) => a,
+                    Err(ResultCode::NotFound) => vec![Value::null(); self.aux_columns.len()],
+                    Err(e) => return Err(e),
+                };
+                self.insert_leaf_row(&conn, c.rowid, &c, &aux)?;
+            }
+        }
         Ok(())
     }
 
