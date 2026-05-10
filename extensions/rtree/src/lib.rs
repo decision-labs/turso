@@ -29,6 +29,8 @@ const RTREE_MAX_DIMENSIONS: usize = 5;
 /// Matches `RTREE_MAX_AUX_COLUMN` in SQLite `ext/rtree/rtree.c`.
 const RTREE_MAX_AUX_COLUMN: usize = 100;
 const RTREE_DEFAULT_ROWEST: i64 = 1048576;
+/// Matches `RTREE_MIN_ROWEST` in SQLite `ext/rtree/rtree.c` (floor when estimating rows).
+const RTREE_MIN_ROWEST: u32 = 100;
 
 const RTREE_EQ: u8 = b'A';
 const RTREE_LE: u8 = b'B';
@@ -916,6 +918,33 @@ fn split_node(
     (left_node, right_node)
 }
 
+/// Bounding box for all entries in `node`, stored as an internal-node cell referencing child `child_nodeno`.
+fn bounding_cell_for_child_node(
+    table: &RtreeTable,
+    node: &RtreeNode,
+    child_nodeno: i64,
+    n_dim2: usize,
+) -> RtreeCell {
+    let n_dim = n_dim2 / 2;
+    let mut out = RtreeCell::new(child_nodeno);
+    let n_cells = node.cell_count();
+    if n_cells == 0 {
+        return out;
+    }
+    for j in 0..n_dim {
+        let mut mn = f32::MAX;
+        let mut mx = f32::MIN;
+        for i in 0..n_cells {
+            let cell = node.get_cell(n_dim2, table.n_bytes_per_cell, i);
+            mn = mn.min(cell.coords[2 * j]);
+            mx = mx.max(cell.coords[2 * j + 1]);
+        }
+        out.coords[2 * j] = mn;
+        out.coords[2 * j + 1] = mx;
+    }
+    out
+}
+
 impl VTable for RtreeTable {
     type Cursor = RtreeCursor;
     type Error = ResultCode;
@@ -999,19 +1028,22 @@ impl VTable for RtreeTable {
                 let right_no = self.node_count;
                 self.write_node(&conn, left_no, &left)?;
                 self.write_node(&conn, right_no, &right)?;
-                // Match SQLite `*_parent`: children record their parent nodeno (here root is always 1).
-                self.write_parent_map(&conn, left_no, 1)?;
-                self.write_parent_map(&conn, right_no, 1)?;
+                // `%_parent`: both new nodes are children of the split node (`nodeno`).
+                self.write_parent_map(&conn, left_no, nodeno)?;
+                self.write_parent_map(&conn, right_no, nodeno)?;
 
-                leaf.set_cell(
-                    self.n_dim2,
-                    self.n_bytes_per_cell,
-                    0,
-                    &RtreeCell::new(left_no),
-                );
-                leaf.set_cell_count(1);
-                leaf.set_depth(leaf.tree_depth() + 1);
-                self.write_node(&conn, 1, &leaf)?;
+                let cell_left =
+                    bounding_cell_for_child_node(self, &left, left_no, self.n_dim2);
+                let cell_right =
+                    bounding_cell_for_child_node(self, &right, right_no, self.n_dim2);
+                leaf.set_cell(self.n_dim2, self.n_bytes_per_cell, 0, &cell_left);
+                leaf.set_cell(self.n_dim2, self.n_bytes_per_cell, 1, &cell_right);
+                leaf.set_cell_count(2);
+                // Tree depth lives only on root blob (`nodeno == 1`); see `RtreeNode::set_depth`.
+                if nodeno == 1 {
+                    leaf.set_depth(leaf.tree_depth() + 1);
+                }
+                self.write_node(&conn, nodeno, &leaf)?;
                 if new_idx < mid {
                     left_no
                 } else {
@@ -1062,7 +1094,7 @@ impl VTable for RtreeTable {
         let mut idx_num = -1;
         let mut idx_str = None;
         let mut estimated_cost = 1000000.0;
-        let mut estimated_rows = RTREE_DEFAULT_ROWEST as u32;
+        let mut estimated_rows = (RTREE_DEFAULT_ROWEST as u32).max(RTREE_MIN_ROWEST);
         let mut constraint_usages = Vec::with_capacity(constraints.len());
 
         for constraint in constraints {
@@ -1595,6 +1627,39 @@ mod tests {
         let (left, right) = split_node(&table, &node, &cell, 4);
 
         assert!(left.cell_count() > 0 || right.cell_count() > 0);
+    }
+
+    #[test]
+    fn test_bounding_cell_for_child_node() {
+        let table = new_table(vec![
+            "rtree", "main", "test", "id", "xmin", "xmax", "ymin", "ymax",
+        ]);
+        let n_dim2 = 4;
+        let n_bytes = table.n_bytes_per_cell;
+        let mut node = RtreeNode::new(1, 0, 4096 - 64);
+
+        let mut a = RtreeCell::new(1);
+        a.coords[0] = 0.0;
+        a.coords[1] = 1.0;
+        a.coords[2] = 0.0;
+        a.coords[3] = 1.0;
+
+        let mut b = RtreeCell::new(2);
+        b.coords[0] = 2.0;
+        b.coords[1] = 10.0;
+        b.coords[2] = 3.0;
+        b.coords[3] = 4.0;
+
+        node.set_cell(n_dim2, n_bytes, 0, &a);
+        node.set_cell(n_dim2, n_bytes, 1, &b);
+        node.set_cell_count(2);
+
+        let bc = bounding_cell_for_child_node(&table, &node, 99, n_dim2);
+        assert_eq!(bc.rowid, 99);
+        assert!((bc.coords[0] - 0.0).abs() < 1e-5);
+        assert!((bc.coords[1] - 10.0).abs() < 1e-5);
+        assert!((bc.coords[2] - 0.0).abs() < 1e-5);
+        assert!((bc.coords[3] - 4.0).abs() < 1e-5);
     }
 
     #[test]
