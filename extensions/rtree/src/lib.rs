@@ -12,12 +12,13 @@
 //! ```
 //!
 //! Shadow tables follow SQLite's `ext/rtree/rtree.c`: `%_node`, `%_rowid`, `%_parent`.
+//! Auxiliary columns (`+label` / `+label TEXT` in the column list) extend `%_rowid` after `nodeno`.
 
 use std::sync::Arc;
 use turso_ext::{
     register_extension, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo,
     OrderByInfo, ResultCode, StepResult, VTabCursor, VTabKind, VTabModule, VTabModuleDerive,
-    VTable, Value,
+    VTable, Value, ValueType,
 };
 
 register_extension! {
@@ -25,6 +26,8 @@ register_extension! {
 }
 
 const RTREE_MAX_DIMENSIONS: usize = 5;
+/// Matches `RTREE_MAX_AUX_COLUMN` in SQLite `ext/rtree/rtree.c`.
+const RTREE_MAX_AUX_COLUMN: usize = 100;
 const RTREE_DEFAULT_ROWEST: i64 = 1048576;
 
 const RTREE_EQ: u8 = b'A';
@@ -43,6 +46,22 @@ const IDX_NUM_QUERY: i32 = 2;
 const IDX_STR_ROWID: &str = "rowid_lookup";
 const IDX_STR_QUERY: &str = "query";
 
+/// Escape a column name for use inside SQLite `"identifier"` tokens.
+fn quote_sql_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn value_to_owned(v: &Value) -> Value {
+    match v.value_type() {
+        ValueType::Null => Value::null(),
+        ValueType::Integer => Value::from_integer(v.to_integer().unwrap_or(0)),
+        ValueType::Float => Value::from_float(v.to_float().unwrap_or(0.0)),
+        ValueType::Text => Value::from_text(v.to_text().unwrap_or("").to_string()),
+        ValueType::Blob => Value::from_blob(v.to_blob().unwrap_or_default()),
+        ValueType::Error => Value::null(),
+    }
+}
+
 fn constraint_op_to_rtree_op(op: ConstraintOp) -> Option<u8> {
     match op {
         ConstraintOp::Eq => Some(RTREE_EQ),
@@ -58,26 +77,38 @@ fn constraint_op_to_rtree_op(op: ConstraintOp) -> Option<u8> {
 struct RtreeModule;
 
 impl RtreeModule {
-    fn parse_column_args(args: &[Value]) -> Result<usize, ResultCode> {
+    /// Coordinate columns first, then optional `+name` / `+name TYPE` auxiliary columns
+    /// (stored on `%_rowid`, see SQLite `ext/rtree/rtree.c`).
+    fn parse_column_args(args: &[Value]) -> Result<(usize, Vec<String>), ResultCode> {
         let mut n_dim2 = 0;
-        let mut n_aux = 0;
+        let mut aux_names = Vec::new();
+        let mut seen_aux = false;
         for arg in args {
-            if let Some(text) = arg.to_text() {
-                if text.starts_with('+') {
-                    n_aux += 1;
-                } else if n_aux == 0 {
-                    n_dim2 += 1;
-                } else {
-                    break;
-                }
-            } else {
+            let Some(text) = arg.to_text() else {
                 return Err(ResultCode::InvalidArgs);
+            };
+            if text.starts_with('+') {
+                seen_aux = true;
+                let rest = text[1..].trim();
+                let name = rest
+                    .split_whitespace()
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or(ResultCode::InvalidArgs)?;
+                aux_names.push(name.to_string());
+            } else if !seen_aux {
+                n_dim2 += 1;
+            } else {
+                break;
             }
         }
         if n_dim2 < 2 || n_dim2 > RTREE_MAX_DIMENSIONS * 2 || n_dim2 % 2 != 0 {
             return Err(ResultCode::InvalidArgs);
         }
-        Ok(n_dim2)
+        if aux_names.len() > RTREE_MAX_AUX_COLUMN {
+            return Err(ResultCode::InvalidArgs);
+        }
+        Ok((n_dim2, aux_names))
     }
 }
 
@@ -92,7 +123,7 @@ impl VTabModule for RtreeModule {
             return Err(ResultCode::InvalidArgs);
         }
 
-        let n_dim2 = Self::parse_column_args(&args[4..])?;
+        let (n_dim2, aux_columns) = Self::parse_column_args(&args[4..])?;
         let n_dim = n_dim2 / 2;
 
         let n_bytes_per_cell: usize = 8 + n_dim2 * 4;
@@ -106,6 +137,9 @@ impl VTabModule for RtreeModule {
             columns.push_str(", x");
             columns.push_str(&i.to_string());
             columns.push_str("max REAL");
+        }
+        for name in &aux_columns {
+            columns.push_str(&format!(", {} TEXT", quote_sql_ident(name)));
         }
         let schema = format!("CREATE TABLE x ({})", columns);
 
@@ -123,6 +157,7 @@ impl VTabModule for RtreeModule {
             row_count: 0,
             node_count: 0,
             table_name,
+            aux_columns,
         };
 
         Ok((schema, table))
@@ -138,6 +173,8 @@ struct RtreeTable {
     row_count: i64,
     node_count: i64,
     table_name: String,
+    /// Auxiliary column names (`+col` in CREATE); persisted on `%_rowid` after `nodeno`.
+    aux_columns: Vec<String>,
 }
 
 impl RtreeTable {
@@ -193,10 +230,14 @@ impl RtreeTable {
         conn.execute(&node_sql, &[])
             .map_err(|_| ResultCode::Error)?;
 
-        let rowid_sql = format!(
-            "CREATE TABLE {} (rowid INTEGER PRIMARY KEY, nodeno INTEGER)",
+        let mut rowid_sql = format!(
+            "CREATE TABLE {} (rowid INTEGER PRIMARY KEY, nodeno INTEGER",
             self.shadow_rowid_table()
         );
+        for name in &self.aux_columns {
+            rowid_sql.push_str(&format!(", {} TEXT", quote_sql_ident(name)));
+        }
+        rowid_sql.push(')');
         conn.execute(&rowid_sql, &[])
             .map_err(|_| ResultCode::Error)?;
 
@@ -285,16 +326,27 @@ impl RtreeTable {
         conn: &Arc<Connection>,
         rowid: i64,
         nodeno: i64,
+        aux: &[Value],
     ) -> Result<(), ResultCode> {
-        let sql = format!(
-            "INSERT OR REPLACE INTO {} (rowid, nodeno) VALUES (?, ?)",
+        if aux.len() != self.aux_columns.len() {
+            return Err(ResultCode::InvalidArgs);
+        }
+        let mut sql = format!(
+            "INSERT OR REPLACE INTO {} (rowid, nodeno",
             self.shadow_rowid_table()
         );
-        conn.execute(
-            &sql,
-            &[Value::from_integer(rowid), Value::from_integer(nodeno)],
-        )
-        .map_err(|_| ResultCode::Error)?;
+        for name in &self.aux_columns {
+            sql.push_str(&format!(", {}", quote_sql_ident(name)));
+        }
+        sql.push_str(") VALUES (?");
+        sql.push_str(", ?");
+        for _ in 0..self.aux_columns.len() {
+            sql.push_str(", ?");
+        }
+        sql.push(')');
+        let mut params: Vec<Value> = vec![Value::from_integer(rowid), Value::from_integer(nodeno)];
+        params.extend(aux.iter().map(value_to_owned));
+        conn.execute(&sql, &params).map_err(|_| ResultCode::Error)?;
         Ok(())
     }
 
@@ -522,6 +574,8 @@ struct RtreeCursor {
     n_bytes_per_cell: usize,
     node_size: usize,
     table_name: String,
+    aux_columns: Vec<String>,
+    aux_values: Vec<Value>,
 }
 
 impl RtreeCursor {
@@ -531,6 +585,7 @@ impl RtreeCursor {
         n_bytes_per_cell: usize,
         node_size: usize,
         table_name: String,
+        aux_columns: Vec<String>,
     ) -> Self {
         RtreeCursor {
             at_eof: true,
@@ -542,7 +597,42 @@ impl RtreeCursor {
             n_bytes_per_cell,
             node_size,
             table_name,
+            aux_columns,
+            aux_values: Vec::new(),
         }
+    }
+
+    fn shadow_rowid_sql_name(&self) -> String {
+        format!("{}_rowid", self.table_name)
+    }
+
+    fn load_aux_values(&mut self) -> Result<(), ResultCode> {
+        self.aux_values.clear();
+        if self.aux_columns.is_empty() || self.rowid == 0 {
+            return Ok(());
+        }
+        let conn = self.conn.as_ref().ok_or(ResultCode::Error)?;
+        let col_list = self
+            .aux_columns
+            .iter()
+            .map(|n| quote_sql_ident(n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {} FROM {} WHERE rowid = ?",
+            col_list,
+            self.shadow_rowid_sql_name()
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|_| ResultCode::Error)?;
+        stmt.bind_at(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            Value::from_integer(self.rowid),
+        );
+        if stmt.step() == StepResult::Row {
+            let row = stmt.get_row();
+            self.aux_values = row.iter().map(value_to_owned).collect();
+        }
+        Ok(())
     }
 
     fn load_node(&self, node_no: i64) -> Option<RtreeNode> {
@@ -837,6 +927,7 @@ impl VTable for RtreeTable {
             self.n_bytes_per_cell,
             self.node_size,
             self.table_name.clone(),
+            self.aux_columns.clone(),
         ))
     }
 
@@ -860,8 +951,9 @@ impl VTable for RtreeTable {
         let Some(conn) = conn else {
             return Err(ResultCode::InvalidArgs);
         };
-        // xUpdate passes argv[2..] as `columns`: id + coordinate pairs (see turso_macros vtab_derive).
-        if args.len() < self.n_dim2 + 1 {
+        // xUpdate passes argv[2..] as `columns`: id + coordinate pairs + optional aux (see vtab_derive).
+        let required = self.n_dim2 + 1 + self.aux_columns.len();
+        if args.len() < required {
             return Err(ResultCode::InvalidArgs);
         }
         let rowid = match args.first().and_then(|v| v.to_integer()) {
@@ -937,7 +1029,8 @@ impl VTable for RtreeTable {
             new_node_no
         };
 
-        self.write_rowid_map(&conn, rowid, leaf_nodeno)?;
+        let aux = &args[self.n_dim2 + 1..required];
+        self.write_rowid_map(&conn, rowid, leaf_nodeno, aux)?;
 
         Ok(rowid)
     }
@@ -1044,6 +1137,7 @@ impl VTabCursor for RtreeCursor {
     fn filter(&mut self, args: &[Value], idx_info: Option<(&str, i32)>) -> ResultCode {
         self.at_eof = true;
         self.constraints.clear();
+        self.aux_values.clear();
         self.rowid = 0;
 
         let idx_str = idx_info.map(|(s, _)| s).unwrap_or("query");
@@ -1078,6 +1172,9 @@ impl VTabCursor for RtreeCursor {
                                                             &cell.coords[..self.n_dim2 * 2],
                                                         );
                                                     self.at_eof = false;
+                                                    if self.load_aux_values() != Ok(()) {
+                                                        return ResultCode::Error;
+                                                    }
                                                     return ResultCode::OK;
                                                 }
                                             }
@@ -1152,6 +1249,9 @@ impl VTabCursor for RtreeCursor {
                                 self.current_coords[..self.n_dim2 * 2]
                                     .copy_from_slice(&cell.coords[..self.n_dim2 * 2]);
                                 self.at_eof = false;
+                                if self.load_aux_values() != Ok(()) {
+                                    return ResultCode::Error;
+                                }
                                 return ResultCode::OK;
                             }
 
@@ -1211,12 +1311,15 @@ impl VTabCursor for RtreeCursor {
         if idx == 0 {
             return Ok(Value::from_integer(self.rowid));
         }
-        let coord_idx = (idx - 1) as usize;
-        if coord_idx < self.current_coords.len() {
-            Ok(Value::from_float(self.current_coords[coord_idx] as f64))
-        } else {
-            Ok(Value::null())
+        let i = idx as usize;
+        if i <= self.n_dim2 {
+            return Ok(Value::from_float(self.current_coords[i - 1] as f64));
         }
+        let aux_i = i - 1 - self.n_dim2;
+        if aux_i < self.aux_values.len() {
+            return Ok(value_to_owned(&self.aux_values[aux_i]));
+        }
+        Ok(Value::null())
     }
 
     fn eof(&self) -> bool {
@@ -1269,6 +1372,9 @@ impl VTabCursor for RtreeCursor {
                                 self.current_coords[..self.n_dim2 * 2]
                                     .copy_from_slice(&cell.coords[..self.n_dim2 * 2]);
                                 self.at_eof = false;
+                                if self.load_aux_values() != Ok(()) {
+                                    return ResultCode::Error;
+                                }
                                 return ResultCode::OK;
                             }
 
@@ -1344,6 +1450,16 @@ mod tests {
         ]);
         assert_eq!(table.n_dim2, 4);
         assert_eq!(table.n_dim2 / 2, 2);
+        assert!(table.aux_columns.is_empty());
+    }
+
+    #[test]
+    fn test_create_table_with_aux_column() {
+        let table = new_table(vec![
+            "rtree", "main", "t", "id", "xmin", "xmax", "ymin", "ymax", "+label",
+        ]);
+        assert_eq!(table.n_dim2, 4);
+        assert_eq!(table.aux_columns, vec!["label".to_string()]);
     }
 
     #[test]
