@@ -13,6 +13,15 @@
 //!
 //! Shadow tables follow SQLite's `ext/rtree/rtree.c`: `%_node`, `%_rowid`, `%_parent`.
 //! Auxiliary columns (`+label` / `+label TEXT` in the column list) extend `%_rowid` after `nodeno`.
+//!
+//! ## SQLite parity (intentional gaps)
+//!
+//! - `MATCH` / `sqlite3_rtree_geometry_callback`-style geometry callbacks are not implemented.
+//! - `RTREE_COORD_INT32` (32-bit integer coordinates) is not implemented.
+//! - Row-count estimates from `sqlite_stat1` in `best_index` are not wired (static `best_index` has no table handle).
+//! - Internal-node overflow / `SplitNode` recursion as in `rtreeInsertCell` is not needed for the current
+//!   in-place leaf split strategy (parent fanout stays bounded); a full port would be required if that changes.
+//! - Delete of the last entry in a subtree does not run SQLite’s full `removeNode` / tree-condense path.
 
 use std::sync::Arc;
 use turso_ext::{
@@ -468,6 +477,49 @@ impl RtreeTable {
                 parent_node.set_cell(self.n_dim2, self.n_bytes_per_cell, idx, &pc);
                 self.write_node(conn, parent_no, &parent_node)?;
             }
+            nodeno = parent_no;
+        }
+        Ok(())
+    }
+
+    /// Walk toward the root and **replace** each ancestor pointer cell's MBR with the tight union of the
+    /// child node's cells (SQLite `fixBoundingBox` / tightening after delete).
+    fn tighten_ancestry_mbr(
+        &self,
+        conn: &Arc<Connection>,
+        mut nodeno: i64,
+    ) -> Result<(), ResultCode> {
+        let mut hops = 0;
+        loop {
+            if hops > 100 {
+                return Err(ResultCode::Error);
+            }
+            hops += 1;
+
+            let Some(node) = self.read_node(conn, nodeno)? else {
+                break;
+            };
+            if node.cell_count() == 0 {
+                break;
+            }
+            let Some(tight) = union_mbr_of_node_cells(self, &node, self.n_dim2) else {
+                break;
+            };
+            let Some(parent_no) = self.get_parent_nodeno(conn, nodeno)? else {
+                break;
+            };
+            let Some(mut parent_node) = self.read_node(conn, parent_no)? else {
+                return Err(ResultCode::Error);
+            };
+            let Some(idx) = self.find_cell_index(&parent_node, nodeno) else {
+                return Err(ResultCode::Error);
+            };
+            let mut pc = parent_node.get_cell(self.n_dim2, self.n_bytes_per_cell, idx);
+            let ptr = pc.rowid;
+            pc.coords = tight.coords;
+            pc.rowid = ptr;
+            parent_node.set_cell(self.n_dim2, self.n_bytes_per_cell, idx, &pc);
+            self.write_node(conn, parent_no, &parent_node)?;
             nodeno = parent_no;
         }
         Ok(())
@@ -1086,6 +1138,24 @@ impl VTable for RtreeTable {
         Ok(())
     }
 
+    fn update(
+        &mut self,
+        conn: Option<Arc<Connection>>,
+        old_rowid: i64,
+        args: &[Value],
+    ) -> Result<(), Self::Error> {
+        let Some(conn) = conn else {
+            return Err(ResultCode::InvalidArgs);
+        };
+        let required = self.n_dim2 + 1 + self.aux_columns.len();
+        if args.len() < required {
+            return Err(ResultCode::InvalidArgs);
+        }
+        self.delete(Some(conn.clone()), old_rowid)?;
+        self.insert(Some(conn), args)?;
+        Ok(())
+    }
+
     fn insert(
         &mut self,
         conn: Option<Arc<Connection>>,
@@ -1190,6 +1260,9 @@ impl VTable for RtreeTable {
                 if let Some(cell_idx) = self.find_cell_index(&node, rowid) {
                     self.delete_cell_from_node(&mut node, cell_idx);
                     self.write_node(&conn, nodeno, &node)?;
+                    if node.cell_count() > 0 {
+                        self.tighten_ancestry_mbr(&conn, nodeno)?;
+                    }
                 }
             }
         }
@@ -1834,5 +1907,23 @@ mod tests {
 
         let remaining_cell = node.get_cell(n_dim2, n_bytes_per_cell, 0);
         assert_eq!(remaining_cell.rowid, 2);
+    }
+
+    #[test]
+    fn test_update_requires_conn() {
+        let mut table = new_table(vec![
+            "rtree", "main", "test", "id", "xmin", "xmax", "ymin", "ymax",
+        ]);
+        let args = [
+            Value::from_integer(1),
+            Value::from_float(0.0),
+            Value::from_float(1.0),
+            Value::from_float(0.0),
+            Value::from_float(1.0),
+        ];
+        assert_eq!(
+            VTable::update(&mut table, None, 1, &args),
+            Err(ResultCode::InvalidArgs)
+        );
     }
 }
