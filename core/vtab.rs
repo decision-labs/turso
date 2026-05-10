@@ -225,10 +225,14 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn update(&self, args: &[Value]) -> crate::Result<Option<i64>> {
+    pub(crate) fn update(
+        &self,
+        conn: Arc<Connection>,
+        args: &[Value],
+    ) -> crate::Result<Option<i64>> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ReadOnly),
-            VirtualTableType::External(table) => table.update(args),
+            VirtualTableType::External(table) => table.update(conn, args),
             VirtualTableType::Internal(_) => Err(LimboError::ReadOnly),
         }
     }
@@ -483,18 +487,37 @@ impl ExtVirtualTable {
         ExtVirtualTableCursor::new(cursor, ext_conn_ptr, self.implementation.clone(), id)
     }
 
-    fn update(&self, args: &[Value]) -> crate::Result<Option<i64>> {
+    fn update(&self, conn: Arc<Connection>, args: &[Value]) -> crate::Result<Option<i64>> {
         let arg_count = args.len();
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
-        let newrowid = 0i64;
+        let mut newrowid = 0i64;
+
+        let weak = Arc::downgrade(&conn);
+        let weak_box = Box::into_raw(Box::new(weak));
+        let ext_conn = turso_ext::Conn::new(
+            weak_box as *mut c_void,
+            crate::ext::prepare_stmt,
+            crate::ext::execute,
+        );
+        let ext_conn_ptr = Box::into_raw(Box::new(ext_conn));
+
         let rc = unsafe {
             (self.implementation.update)(
                 self.table_ptr.load(Ordering::SeqCst) as *const c_void,
+                ext_conn_ptr as *const turso_ext::Conn,
                 arg_count as i32,
                 ext_args.as_ptr(),
-                &newrowid as *const _ as *mut i64,
+                &mut newrowid as *mut i64,
             )
         };
+
+        unsafe {
+            let conn_box = Box::from_raw(ext_conn_ptr);
+            if !conn_box._ctx.is_null() {
+                let _ = Box::from_raw(conn_box._ctx as *mut Weak<Connection>);
+            }
+        }
+
         for arg in ext_args {
             unsafe {
                 arg.__free_internal_type();

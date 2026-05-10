@@ -105,6 +105,7 @@ pub type VtabRowIDFn = unsafe extern "C" fn(cursor: *const c_void) -> i64;
 
 pub type VtabFnUpdate = unsafe extern "C" fn(
     table: *const c_void,
+    conn: *const Conn,
     argc: i32,
     argv: *const Value,
     p_out_rowid: *mut i64,
@@ -159,16 +160,25 @@ pub trait VTable {
     fn rollback(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
-    fn update(&mut self, _rowid: i64, _args: &[Value]) -> Result<(), Self::Error> {
+    fn update(
+        &mut self,
+        _conn: Option<Arc<Connection>>,
+        _rowid: i64,
+        _args: &[Value],
+    ) -> Result<(), Self::Error> {
         Ok(())
     }
     fn rename(&mut self, _new_name: &str) -> Result<(), Self::Error> {
         Ok(())
     }
-    fn insert(&mut self, _args: &[Value]) -> Result<i64, Self::Error> {
+    fn insert(
+        &mut self,
+        _conn: Option<Arc<Connection>>,
+        _args: &[Value],
+    ) -> Result<i64, Self::Error> {
         Ok(0)
     }
-    fn delete(&mut self, _rowid: i64) -> Result<(), Self::Error> {
+    fn delete(&mut self, _conn: Option<Arc<Connection>>, _rowid: i64) -> Result<(), Self::Error> {
         Ok(())
     }
     fn destroy(&mut self) -> Result<(), Self::Error> {

@@ -140,6 +140,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
             #[no_mangle]
             unsafe extern "C" fn #update_fn_name(
                 table: *const ::std::ffi::c_void,
+                conn: *const ::turso_ext::Conn,
                 argc: i32,
                 argv: *const ::turso_ext::Value,
                 p_out_rowid: *mut i64,
@@ -150,6 +151,11 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 
                 let table = &mut *(table as *mut <#struct_name as ::turso_ext::VTabModule>::Table);
                 let args = ::std::slice::from_raw_parts(argv, argc as usize);
+                let rust_conn = if conn.is_null() {
+                    None
+                } else {
+                    Some(::std::sync::Arc::new(::turso_ext::Connection::new(conn)))
+                };
 
                 let old_rowid = match args.get(0).map(|v| v.value_type()) {
                     Some(::turso_ext::ValueType::Integer) => args.get(0).unwrap().to_integer(),
@@ -163,21 +169,21 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 match (old_rowid, new_rowid) {
                     // DELETE: old_rowid provided, no new_rowid
                     (Some(old), None) => {
-                     if <#struct_name as VTabModule>::Table::delete(table, old).is_err() {
+                     if <#struct_name as VTabModule>::Table::delete(table, rust_conn, old).is_err() {
                             return ::turso_ext::ResultCode::Error;
                       }
                             return ::turso_ext::ResultCode::OK;
                     }
                     // UPDATE: old_rowid provided and new_rowid may exist
-                    (Some(old), Some(new)) => {
-                        if <#struct_name as VTabModule>::Table::update(table, old, &columns).is_err() {
+                    (Some(old), Some(_new)) => {
+                        if <#struct_name as VTabModule>::Table::update(table, rust_conn, old, &columns).is_err() {
                             return ::turso_ext::ResultCode::Error;
                         }
                         return ::turso_ext::ResultCode::OK;
                     }
                     // INSERT: no old_rowid (old_rowid = None)
                     (None, _) => {
-                        if let Ok(rowid) = <#struct_name as VTabModule>::Table::insert(table, &columns) {
+                        if let Ok(rowid) = <#struct_name as VTabModule>::Table::insert(table, rust_conn, &columns) {
                             if !p_out_rowid.is_null() {
                                 *p_out_rowid = rowid;
                                  return ::turso_ext::ResultCode::RowID;

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -856,6 +857,51 @@ def test_sqlite_vfs_compat():
     sqlite.quit()
 
 
+def test_rtree():
+    """Load rtree vtab, insert rows, and query with a range constraint."""
+
+    def full_scan_ok(res: str) -> bool:
+        parts = [p.strip() for p in res.split("|")]
+        if len(parts) != 5:
+            return False
+        try:
+            return parts[0] == "1" and math.isclose(float(parts[1]), 0.0) and math.isclose(float(parts[2]), 10.0) and math.isclose(float(parts[3]), 0.0) and math.isclose(float(parts[4]), 10.0)
+        except ValueError:
+            return False
+
+    turso = TestTursoShell(init_commands="")
+    ext_path = "./target/debug/liblimbo_rtree"
+    test_module_list(turso, ext_path, "rtree")
+
+    turso.run_test_fn(
+        "CREATE VIRTUAL TABLE rx USING rtree(id, xmin, xmax, ymin, ymax);",
+        null,
+        "create empty rtree table",
+    )
+    turso.run_test_fn(
+        "INSERT INTO rx VALUES (1, 0.0, 10.0, 0.0, 10.0);",
+        null,
+        "insert one bounding box",
+    )
+    turso.run_test_fn(
+        "SELECT id, xmin, xmax, ymin, ymax FROM rx;",
+        full_scan_ok,
+        "full scan of single row",
+    )
+    turso.run_test_fn(
+        "SELECT id FROM rx WHERE xmin > 5.0 AND ymin > -1.0;",
+        lambda res: res == "",
+        "no hit when query misses bbox",
+    )
+    turso.run_test_fn(
+        "SELECT id FROM rx WHERE xmin > -1.0 AND xmax < 15.0 AND ymin > -1.0 AND ymax < 15.0;",
+        lambda res: res == "1",
+        "constraint scan hits the row",
+    )
+    turso.run_test_fn("DROP TABLE rx;", null, "drop rtree table")
+    turso.quit()
+
+
 def test_csv():
     # open new empty connection explicitly to test whether we can load an extension
     # with brand new connection/uninitialized database.
@@ -1058,6 +1104,7 @@ def main():
         test_csv()
         test_tablestats()
         test_fuzzy()
+        test_rtree()
     except Exception as e:
         console.error(f"Test FAILED: {e}")
         cleanup()

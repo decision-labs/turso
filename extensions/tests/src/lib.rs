@@ -252,7 +252,11 @@ impl VTable for KVStoreTable {
         })
     }
 
-    fn insert(&mut self, values: &[Value]) -> Result<i64, Self::Error> {
+    fn insert(
+        &mut self,
+        _conn: Option<Arc<Connection>>,
+        values: &[Value],
+    ) -> Result<i64, Self::Error> {
         let comment = values
             .first()
             .and_then(|v| v.to_text())
@@ -275,16 +279,21 @@ impl VTable for KVStoreTable {
         Ok(rowid)
     }
 
-    fn delete(&mut self, rowid: i64) -> Result<(), Self::Error> {
+    fn delete(&mut self, _conn: Option<Arc<Connection>>, rowid: i64) -> Result<(), Self::Error> {
         self.store.borrow_mut().remove(&rowid);
         Ok(())
     }
 
-    fn update(&mut self, rowid: i64, values: &[Value]) -> Result<(), Self::Error> {
+    fn update(
+        &mut self,
+        conn: Option<Arc<Connection>>,
+        rowid: i64,
+        values: &[Value],
+    ) -> Result<(), Self::Error> {
         {
             self.store.borrow_mut().remove(&rowid);
         }
-        let _ = self.insert(values)?;
+        let _ = self.insert(conn, values)?;
         Ok(())
     }
 
