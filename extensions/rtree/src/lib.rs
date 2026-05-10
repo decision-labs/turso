@@ -19,13 +19,11 @@
 //! - `MATCH` / `sqlite3_rtree_geometry_callback`-style geometry callbacks are not implemented.
 //! - `RTREE_COORD_INT32` (32-bit integer coordinates) is not implemented.
 //! - Row-count estimates from `sqlite_stat1` in `best_index` are not wired (static `best_index` has no table handle).
-//! - Internal-node overflow / `SplitNode` recursion as in `rtreeInsertCell` is not needed for the current
-//!   in-place leaf split strategy (parent fanout stays bounded); a full port would be required if that changes.
-//! - Root collapse when the root has exactly one child (`rtreeDeleteRowid` in `rtree.c`) is implemented only for the
-//!   **two-level** tree (`tree_depth == 2` on the root blob, i.e. one internal level above leaves). Deeper trees still
-//!   need `ChooseLeaf`/`rtreeInsertCell` at `iHeight > 0` for reinsert.
-//! - When an **internal** node is underfull (`iHeight > 0`), SQLite removes and reinserts subtree
-//!   pointers (`ChooseLeaf` / `rtreeInsertCell` at height); we only tighten bounding boxes.
+//! - Leaf insert uses in-place splits; **internal** `SplitNode` when a reinserted pointer cell hits a full node
+//!   (`insert_internal_cell_at_height`) returns `Unimplemented`.
+//! - Root collapse (`rtreeDeleteRowid` ~2978) queues cells at height `iDepth-1`; `descend_from_root_with_start` matches
+//!   SQLite `ChooseLeaf` descent counts (`iDepth - iHeight`).
+//! - When an **internal** node is underfull on delete, SQLite removes and reinserts subtree pointers; we only tighten.
 
 use std::sync::Arc;
 use turso_ext::{
@@ -526,6 +524,40 @@ impl RtreeTable {
         Ok(())
     }
 
+    /// Reinsert one internal pointer cell (`rtreeInsertCell` with `iHeight > 0` in `rtree.c`). Does not implement
+    /// internal `SplitNode` when the target node is full.
+    fn insert_internal_cell_at_height(
+        &mut self,
+        conn: &Arc<Connection>,
+        cell: &RtreeCell,
+        cell_height: usize,
+    ) -> Result<(), ResultCode> {
+        let root = self.load_root_node(conn)?;
+        let sqlite_depth = root.tree_depth().saturating_sub(1);
+        let iterations = sqlite_depth.saturating_sub(cell_height);
+        let Some(mut target) = descend_from_root_with_start(
+            self,
+            Some(conn),
+            root,
+            cell,
+            self.n_dim2,
+            iterations,
+        ) else {
+            return Err(ResultCode::Corrupt);
+        };
+        let nodeno = target.node_no;
+        let n = target.cell_count();
+        if n >= self.max_cells() {
+            return Err(ResultCode::Unimplemented);
+        }
+        target.set_cell(self.n_dim2, self.n_bytes_per_cell, n, cell);
+        target.set_cell_count(n + 1);
+        self.write_node(conn, nodeno, &target)?;
+        self.adjust_ancestry_mbr(conn, nodeno)?;
+        self.write_parent_map(conn, cell.rowid, nodeno)?;
+        Ok(())
+    }
+
     /// After removing a cell, enforce SQLite-style minimum fill (`RTREE_MINCELLS`): detach underfull
     /// nodes, then queue leaf cells for reinsert (see `removeNode` / `reinsertNodeContent` in `rtree.c`).
     fn fix_after_cell_removal(
@@ -599,10 +631,7 @@ impl RtreeTable {
     }
 
     /// If the root has exactly one subtree after deletes (`rtreeDeleteRowid` in `rtree.c`, ~2978–3000), detach that
-    /// child, drop its shadow rows, lower the stored depth, and queue its cells for reinsert.
-    ///
-    /// We only handle the case **`tree_depth == 2`** (one level of internal nodes above leaves), so queued cells are
-    /// always leaf rows (`height == 0`). Taller trees require internal-node reinsert.
+    /// child, drop its shadow rows, lower the stored depth, and queue its cells for reinsert at height `iDepth-1`.
     fn maybe_collapse_root_single_child(
         &mut self,
         conn: &Arc<Connection>,
@@ -614,7 +643,7 @@ impl RtreeTable {
         let r = root.tree_depth();
         // Align with SQLite `iDepth > 0 && NCELL(pRoot)==1`: estimate SQLite depth as r - 1 (see ChooseLeaf descent).
         let sqlite_depth = r.saturating_sub(1);
-        if sqlite_depth == 0 || root.cell_count() != 1 || r != 2 {
+        if sqlite_depth == 0 || root.cell_count() != 1 {
             return Ok(());
         }
 
@@ -1170,21 +1199,25 @@ fn nonleaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: us
     }
 }
 
-fn choose_leaf(
+/// Descend from `start` for `iterations` levels using the same heuristic as SQLite `ChooseLeaf` / [`choose_leaf`]
+/// (minimum axis-aligned bounding area among children). Matches `for (ii < iDepth - iHeight)` when
+/// `iterations = iDepth - iHeight` with `iDepth ≈ root.tree_depth() - 1` in our root encoding.
+fn descend_from_root_with_start(
     table: &RtreeTable,
     conn: Option<&Arc<Connection>>,
+    mut current: RtreeNode,
     _cell: &RtreeCell,
     n_dim2: usize,
+    iterations: usize,
 ) -> Option<RtreeNode> {
-    let root = match conn {
-        Some(c) => table.load_root_node(c).ok()?,
-        None => RtreeNode::new(1, 0, table.node_size),
-    };
-    let mut current = root;
     let mut depth = current.tree_depth();
+    let mut remaining = iterations;
 
-    while depth > 1 {
+    while remaining > 0 {
         let n_cells = current.cell_count();
+        if n_cells == 0 {
+            return None;
+        }
         let mut best_idx = 0;
         let mut best_area = f64::MAX;
 
@@ -1227,9 +1260,24 @@ fn choose_leaf(
             current = RtreeNode::new(child_rowid, depth - 1, table.node_size);
         }
         depth -= 1;
+        remaining -= 1;
     }
 
     Some(current)
+}
+
+fn choose_leaf(
+    table: &RtreeTable,
+    conn: Option<&Arc<Connection>>,
+    cell: &RtreeCell,
+    n_dim2: usize,
+) -> Option<RtreeNode> {
+    let root = match conn {
+        Some(c) => table.load_root_node(c).ok()?,
+        None => RtreeNode::new(1, 0, table.node_size),
+    };
+    let iterations = root.tree_depth().saturating_sub(1);
+    descend_from_root_with_start(table, conn, root, cell, n_dim2, iterations)
 }
 
 fn split_node(
@@ -1471,16 +1519,17 @@ impl VTable for RtreeTable {
         self.maybe_collapse_root_single_child(&conn, &mut pending)?;
 
         for (cells, h) in pending {
-            if h != 0 {
-                return Err(ResultCode::Unimplemented);
-            }
             for c in cells {
-                let aux = match self.read_rowid_aux_values(&conn, c.rowid) {
-                    Ok(a) => a,
-                    Err(ResultCode::NotFound) => vec![Value::null(); self.aux_columns.len()],
-                    Err(e) => return Err(e),
-                };
-                self.insert_leaf_row(&conn, c.rowid, &c, &aux)?;
+                if h == 0 {
+                    let aux = match self.read_rowid_aux_values(&conn, c.rowid) {
+                        Ok(a) => a,
+                        Err(ResultCode::NotFound) => vec![Value::null(); self.aux_columns.len()],
+                        Err(e) => return Err(e),
+                    };
+                    self.insert_leaf_row(&conn, c.rowid, &c, &aux)?;
+                } else {
+                    self.insert_internal_cell_at_height(&conn, &c, h)?;
+                }
             }
         }
         Ok(())
