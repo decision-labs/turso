@@ -25,13 +25,7 @@ register_extension! {
 }
 
 const RTREE_MAX_DIMENSIONS: usize = 5;
-const RTREE_MAX_DEPTH: usize = 40;
-const RTREE_CACHE_SZ: usize = 5;
 const RTREE_DEFAULT_ROWEST: i64 = 1048576;
-const RTREE_MAXCELLS: usize = 51;
-
-const RTREE_COORD_REAL32: u8 = 0;
-const RTREE_COORD_INT32: u8 = 1;
 
 const RTREE_EQ: u8 = b'A';
 const RTREE_LE: u8 = b'B';
@@ -64,7 +58,7 @@ fn constraint_op_to_rtree_op(op: ConstraintOp) -> Option<u8> {
 struct RtreeModule;
 
 impl RtreeModule {
-    fn parse_column_args(args: &[Value]) -> Result<(usize, usize), ResultCode> {
+    fn parse_column_args(args: &[Value]) -> Result<usize, ResultCode> {
         let mut n_dim2 = 0;
         let mut n_aux = 0;
         for arg in args {
@@ -77,13 +71,13 @@ impl RtreeModule {
                     break;
                 }
             } else {
-                return Err(ResultCode::Error);
+                return Err(ResultCode::InvalidArgs);
             }
         }
         if n_dim2 < 2 || n_dim2 > RTREE_MAX_DIMENSIONS * 2 || n_dim2 % 2 != 0 {
-            return Err(ResultCode::Error);
+            return Err(ResultCode::InvalidArgs);
         }
-        Ok((n_dim2, n_aux))
+        Ok(n_dim2)
     }
 }
 
@@ -95,10 +89,10 @@ impl VTabModule for RtreeModule {
 
     fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
         if args.len() < 5 {
-            return Err(ResultCode::Error);
+            return Err(ResultCode::InvalidArgs);
         }
 
-        let (n_dim2, n_aux) = Self::parse_column_args(&args[4..])?;
+        let n_dim2 = Self::parse_column_args(&args[4..])?;
         let n_dim = n_dim2 / 2;
 
         let n_bytes_per_cell: usize = 8 + n_dim2 * 4;
@@ -122,15 +116,11 @@ impl VTabModule for RtreeModule {
             .unwrap_or_else(|| "x".to_string());
 
         let table = RtreeTable {
-            n_dim,
             n_dim2,
             n_bytes_per_cell,
-            n_aux,
-            e_coord_type: RTREE_COORD_REAL32,
             node_size: default_node_size,
             depth: 0,
             row_count: 0,
-            aux_columns: vec![],
             node_count: 0,
             table_name,
         };
@@ -141,15 +131,11 @@ impl VTabModule for RtreeModule {
 
 #[derive(Debug, Clone)]
 struct RtreeTable {
-    n_dim: usize,
     n_dim2: usize,
     n_bytes_per_cell: usize,
-    n_aux: usize,
-    e_coord_type: u8,
     node_size: usize,
     depth: usize,
     row_count: i64,
-    aux_columns: Vec<String>,
     node_count: i64,
     table_name: String,
 }
@@ -190,8 +176,6 @@ impl RtreeTable {
                         node_no: 1,
                         depth,
                         data: data_vec,
-                        parent: None,
-                        n_ref: 1,
                         is_dirty: false,
                     });
                 }
@@ -268,8 +252,6 @@ impl RtreeTable {
                         node_no,
                         depth,
                         data: data_vec,
-                        parent: None,
-                        n_ref: 1,
                         is_dirty: false,
                     }));
                 }
@@ -348,6 +330,24 @@ impl RtreeTable {
         Ok(())
     }
 
+    fn write_parent_map(
+        &self,
+        conn: &Arc<Connection>,
+        nodeno: i64,
+        parentnode: i64,
+    ) -> Result<(), ResultCode> {
+        let sql = format!(
+            "INSERT OR REPLACE INTO {} (nodeno, parentnode) VALUES (?, ?)",
+            self.shadow_parent_table()
+        );
+        conn.execute(
+            &sql,
+            &[Value::from_integer(nodeno), Value::from_integer(parentnode)],
+        )
+        .map_err(|_| ResultCode::Error)?;
+        Ok(())
+    }
+
     fn find_cell_index(&self, node: &RtreeNode, rowid: i64) -> Option<usize> {
         let n_cells = node.cell_count();
         for i in 0..n_cells {
@@ -383,8 +383,6 @@ struct RtreeNode {
     node_no: i64,
     depth: usize,
     data: Vec<u8>,
-    parent: Option<Arc<RtreeNode>>,
-    n_ref: usize,
     is_dirty: bool,
 }
 
@@ -399,8 +397,6 @@ impl RtreeNode {
             node_no,
             depth,
             data,
-            parent: None,
-            n_ref: 1,
             is_dirty: true,
         }
     }
@@ -498,23 +494,6 @@ impl RtreeNode {
         }
         coords
     }
-
-    fn bounding_box(&self, n_dim2: usize, n_bytes_per_cell: usize) -> RtreeCell {
-        let n_cells = self.cell_count();
-        let mut bbox = RtreeCell::new(0);
-        for i in 0..n_dim2 {
-            bbox.coords[i] = f32::MAX;
-            bbox.coords[n_dim2 + i] = f32::MIN;
-        }
-        for i in 0..n_cells {
-            let cell_coords = self.coords(n_dim2, n_bytes_per_cell, i);
-            for j in 0..n_dim2 {
-                bbox.coords[j] = bbox.coords[j].min(cell_coords[j]);
-                bbox.coords[n_dim2 + j] = bbox.coords[n_dim2 + j].max(cell_coords[n_dim2 + j]);
-            }
-        }
-        bbox
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -530,46 +509,6 @@ impl RtreeCell {
             coords: [0.0; RTREE_MAX_DIMENSIONS * 2],
         }
     }
-
-    fn bbox_union(&mut self, other: &RtreeCell, n_dim2: usize) {
-        for i in 0..n_dim2 {
-            self.coords[i] = self.coords[i].min(other.coords[i]);
-            self.coords[n_dim2 + i] = self.coords[n_dim2 + i].max(other.coords[n_dim2 + i]);
-        }
-    }
-}
-
-struct RtreeSearchIter<'a> {
-    table: &'a RtreeTable,
-    conn: &'a Arc<Connection>,
-    constraints: &'a [RtreeConstraint],
-    point_queue: Vec<RtreeSearchPoint>,
-    current_rowid: i64,
-    at_eof: bool,
-}
-
-impl<'a> RtreeSearchIter<'a> {
-    fn push_point(&mut self, id: i64, i_level: u8, e_within: u8, i_cell: u8) {
-        self.point_queue.push(RtreeSearchPoint {
-            r_score: 0.0,
-            id,
-            i_level,
-            e_within,
-            i_cell,
-        });
-    }
-
-    fn sort_points(&mut self) {
-        self.point_queue.sort_by(|a, b| {
-            b.r_score
-                .partial_cmp(&a.r_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
-
-    fn next_point(&mut self) -> Option<RtreeSearchPoint> {
-        self.point_queue.pop()
-    }
 }
 
 #[derive(Debug)]
@@ -578,14 +517,11 @@ struct RtreeCursor {
     rowid: i64,
     current_coords: [f32; RTREE_MAX_DIMENSIONS * 2],
     constraints: Vec<RtreeConstraint>,
-    points: Vec<RtreeSearchPoint>,
-    s_point: RtreeSearchPoint,
     conn: Option<Arc<Connection>>,
     n_dim2: usize,
     n_bytes_per_cell: usize,
     node_size: usize,
     table_name: String,
-    nodes: [Option<Arc<RtreeNode>>; RTREE_CACHE_SZ],
 }
 
 impl RtreeCursor {
@@ -601,14 +537,11 @@ impl RtreeCursor {
             rowid: 0,
             current_coords: [0.0; RTREE_MAX_DIMENSIONS * 2],
             constraints: Vec::new(),
-            points: Vec::new(),
-            s_point: RtreeSearchPoint::default(),
             conn,
             n_dim2,
             n_bytes_per_cell,
             node_size,
             table_name,
-            nodes: [const { None }; RTREE_CACHE_SZ],
         }
     }
 
@@ -637,8 +570,6 @@ impl RtreeCursor {
                         node_no,
                         depth,
                         data: data_vec,
-                        parent: None,
-                        n_ref: 1,
                         is_dirty: false,
                     });
                 }
@@ -646,27 +577,6 @@ impl RtreeCursor {
         }
         None
     }
-
-    fn next_search_point(&mut self) -> Option<RtreeSearchPoint> {
-        self.points.pop()
-    }
-
-    fn sort_points(&mut self) {
-        self.points.sort_by(|a, b| {
-            a.r_score
-                .partial_cmp(&b.r_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct RtreeSearchPoint {
-    r_score: f64,
-    id: i64,
-    i_level: u8,
-    e_within: u8,
-    i_cell: u8,
 }
 
 #[derive(Debug)]
@@ -676,57 +586,8 @@ struct RtreeConstraint {
     value: f64,
 }
 
-fn cell_intersects_query(cell: &RtreeCell, constraints: &[RtreeConstraint], n_dim2: usize) -> bool {
-    for cons in constraints {
-        let coord_idx = cons.i_coord;
-        if coord_idx >= n_dim2 * 2 {
-            continue;
-        }
-        let coord_min = if coord_idx < n_dim2 {
-            cell.coords[coord_idx]
-        } else {
-            cell.coords[n_dim2 + (coord_idx % n_dim2)]
-        };
-        let coord_max = if coord_idx < n_dim2 {
-            cell.coords[n_dim2 + coord_idx]
-        } else {
-            cell.coords[coord_idx % n_dim2]
-        };
-        let val = cons.value as f32;
-        match cons.op {
-            b'A' => {
-                if val != coord_min && val != coord_max {
-                    return false;
-                }
-            }
-            b'B' => {
-                if val < coord_min {
-                    return false;
-                }
-            }
-            b'C' => {
-                if val <= coord_max {
-                    return false;
-                }
-            }
-            b'D' => {
-                if val <= coord_max {
-                    return false;
-                }
-            }
-            b'E' => {
-                if val >= coord_min {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    true
-}
-
-fn leaf_constraint(pConstraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize) -> i32 {
-    let coord_idx = pConstraint.i_coord;
+fn leaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize) -> i32 {
+    let coord_idx = constraint.i_coord;
     if coord_idx >= n_dim2 * 2 {
         return FULLY_WITHIN;
     }
@@ -742,8 +603,8 @@ fn leaf_constraint(pConstraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usiz
         cell.coords[coord_idx % n_dim2]
     };
 
-    let val = pConstraint.value as f32;
-    match pConstraint.op {
+    let val = constraint.value as f32;
+    match constraint.op {
         b'A' => {
             if val != coord_min && val != coord_max {
                 NOT_WITHIN
@@ -785,8 +646,8 @@ fn leaf_constraint(pConstraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usiz
     }
 }
 
-fn nonleaf_constraint(pConstraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize) -> i32 {
-    let coord_idx = pConstraint.i_coord;
+fn nonleaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize) -> i32 {
+    let coord_idx = constraint.i_coord;
     if coord_idx >= n_dim2 * 2 {
         return FULLY_WITHIN;
     }
@@ -802,8 +663,8 @@ fn nonleaf_constraint(pConstraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: u
         cell.coords[coord_idx % n_dim2]
     };
 
-    let val = pConstraint.value as f32;
-    match pConstraint.op {
+    let val = constraint.value as f32;
+    match constraint.op {
         b'A' => {
             if val < coord_min || val > coord_max {
                 NOT_WITHIN
@@ -841,41 +702,6 @@ fn nonleaf_constraint(pConstraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: u
         }
         _ => FULLY_WITHIN,
     }
-}
-
-fn compute_r_score(cell: &RtreeCell, constraints: &[RtreeConstraint], n_dim2: usize) -> f64 {
-    let mut r_score = 0.0;
-    for cons in constraints {
-        let coord_idx = cons.i_coord;
-        if coord_idx >= n_dim2 * 2 {
-            continue;
-        }
-        let coord_min = if coord_idx < n_dim2 {
-            cell.coords[coord_idx]
-        } else {
-            cell.coords[n_dim2 + (coord_idx % n_dim2)]
-        };
-        let coord_max = if coord_idx < n_dim2 {
-            cell.coords[n_dim2 + coord_idx]
-        } else {
-            cell.coords[coord_idx % n_dim2]
-        };
-        let val = cons.value as f32;
-        match cons.op {
-            b'B' => {
-                if val > coord_min {
-                    r_score += (val - coord_min) as f64;
-                }
-            }
-            b'D' => {
-                if val <= coord_max {
-                    r_score += (coord_max - val) as f64;
-                }
-            }
-            _ => {}
-        }
-    }
-    r_score
 }
 
 fn choose_leaf(
@@ -1000,74 +826,6 @@ fn split_node(
     (left_node, right_node)
 }
 
-fn rtree_step_to_leaf(cursor: &mut RtreeCursor, table: &RtreeTable) -> ResultCode {
-    while let Some(p) = cursor.next_search_point() {
-        if p.i_level == 0 {
-            continue;
-        }
-
-        let node = cursor.nodes[0].as_ref();
-        let Some(node) = node else {
-            continue;
-        };
-
-        let n_cell = node.cell_count();
-        let n_bytes_per_cell = table.n_bytes_per_cell;
-        let n_dim2 = table.n_dim2;
-
-        let mut p = p;
-        let mut found = false;
-
-        while (p.i_cell as usize) < n_cell {
-            let cell = node.get_cell(n_dim2, n_bytes_per_cell, p.i_cell as usize);
-            let mut e_within = FULLY_WITHIN;
-
-            for constraint in &cursor.constraints {
-                let result = if p.i_level == 1 {
-                    leaf_constraint(constraint, &cell, n_dim2)
-                } else {
-                    nonleaf_constraint(constraint, &cell, n_dim2)
-                };
-
-                if result == NOT_WITHIN {
-                    e_within = NOT_WITHIN;
-                    break;
-                }
-            }
-
-            if e_within != NOT_WITHIN {
-                let r_score = compute_r_score(&cell, &cursor.constraints, n_dim2);
-                let new_point = RtreeSearchPoint {
-                    r_score,
-                    id: p.id,
-                    i_level: p.i_level,
-                    e_within: e_within as u8,
-                    i_cell: p.i_cell,
-                };
-                cursor.points.push(new_point);
-                cursor.sort_points();
-                found = true;
-                break;
-            }
-
-            p.i_cell += 1;
-        }
-
-        if found {
-            break;
-        }
-    }
-
-    if let Some(next_point) = cursor.next_search_point() {
-        cursor.s_point = next_point;
-        cursor.at_eof = false;
-        ResultCode::OK
-    } else {
-        cursor.at_eof = true;
-        ResultCode::EOF
-    }
-}
-
 impl VTable for RtreeTable {
     type Cursor = RtreeCursor;
     type Error = ResultCode;
@@ -1100,11 +858,11 @@ impl VTable for RtreeTable {
         args: &[Value],
     ) -> Result<i64, Self::Error> {
         let Some(conn) = conn else {
-            return Err(ResultCode::Error);
+            return Err(ResultCode::InvalidArgs);
         };
         // xUpdate passes argv[2..] as `columns`: id + coordinate pairs (see turso_macros vtab_derive).
         if args.len() < self.n_dim2 + 1 {
-            return Err(ResultCode::Error);
+            return Err(ResultCode::InvalidArgs);
         }
         let rowid = match args.first().and_then(|v| v.to_integer()) {
             Some(id) => {
@@ -1149,6 +907,9 @@ impl VTable for RtreeTable {
                 let right_no = self.node_count;
                 self.write_node(&conn, left_no, &left)?;
                 self.write_node(&conn, right_no, &right)?;
+                // Match SQLite `*_parent`: children record their parent nodeno (here root is always 1).
+                self.write_parent_map(&conn, left_no, 1)?;
+                self.write_parent_map(&conn, right_no, 1)?;
 
                 leaf.set_cell(
                     self.n_dim2,
@@ -1183,7 +944,7 @@ impl VTable for RtreeTable {
 
     fn delete(&mut self, conn: Option<Arc<Connection>>, rowid: i64) -> Result<(), Self::Error> {
         let Some(conn) = conn else {
-            return Err(ResultCode::Error);
+            return Err(ResultCode::InvalidArgs);
         };
         if let Some(nodeno) = self.get_rowid_nodeno(&conn, rowid)? {
             if let Some(mut node) = self.read_node(&conn, nodeno)? {
@@ -1283,7 +1044,6 @@ impl VTabCursor for RtreeCursor {
     fn filter(&mut self, args: &[Value], idx_info: Option<(&str, i32)>) -> ResultCode {
         self.at_eof = true;
         self.constraints.clear();
-        self.points.clear();
         self.rowid = 0;
 
         let idx_str = idx_info.map(|(s, _)| s).unwrap_or("query");
@@ -1582,9 +1342,8 @@ mod tests {
         let table = new_table(vec![
             "rtree", "main", "test", "id", "xmin", "xmax", "ymin", "ymax",
         ]);
-        assert_eq!(table.n_dim, 2);
         assert_eq!(table.n_dim2, 4);
-        assert_eq!(table.e_coord_type, RTREE_COORD_REAL32);
+        assert_eq!(table.n_dim2 / 2, 2);
     }
 
     #[test]
@@ -1685,7 +1444,6 @@ mod tests {
         let mut coords = [0.0; RTREE_MAX_DIMENSIONS * 2];
         coords[0] = 5.0;
         coords[1] = 10.0;
-        let cell = RtreeCell::new(1);
         let mut test_cell = RtreeCell::new(1);
         test_cell.coords = coords;
 
@@ -1697,25 +1455,6 @@ mod tests {
 
         let result = nonleaf_constraint(&constraint, &test_cell, 4);
         assert_eq!(result, NOT_WITHIN);
-    }
-
-    #[test]
-    fn test_compute_r_score() {
-        let mut coords = [0.0; RTREE_MAX_DIMENSIONS * 2];
-        coords[0] = 5.0;
-        coords[1] = 10.0;
-        let cell = RtreeCell::new(1);
-        let mut test_cell = RtreeCell::new(1);
-        test_cell.coords = coords;
-
-        let constraints = vec![RtreeConstraint {
-            i_coord: 0,
-            op: b'B',
-            value: 6.0,
-        }];
-
-        let score = compute_r_score(&test_cell, &constraints, 4);
-        assert!(score >= 0.0);
     }
 
     #[test]
