@@ -24,7 +24,6 @@
 //!   implemented (`rtreeInsertCell` into parent can still return `Unimplemented`).
 //! - Root collapse (`rtreeDeleteRowid` ~2978) queues cells at height `iDepth-1`; `descend_from_root_with_start` matches
 //!   SQLite `ChooseLeaf` descent counts (`iDepth - iHeight`).
-//! - When an **internal** node is underfull on delete, SQLite removes and reinserts subtree pointers; we only tighten.
 
 use std::sync::Arc;
 use turso_ext::{
@@ -604,8 +603,8 @@ impl RtreeTable {
         Ok(())
     }
 
-    /// After removing a cell, enforce SQLite-style minimum fill (`RTREE_MINCELLS`): detach underfull
-    /// nodes, then queue leaf cells for reinsert (see `removeNode` / `reinsertNodeContent` in `rtree.c`).
+    /// After removing a cell, enforce SQLite-style minimum fill (`RTREE_MINCELLS`): detach underfull **leaf or internal**
+    /// nodes, then queue their cells for reinsert at `height` (`removeNode` / `reinsertNodeContent` in `rtree.c`).
     fn fix_after_cell_removal(
         &mut self,
         conn: &Arc<Connection>,
@@ -641,13 +640,6 @@ impl RtreeTable {
         }
 
         if nodeno == 1 {
-            return Ok(());
-        }
-
-        if height > 0 {
-            if n > 0 {
-                self.tighten_ancestry_mbr(conn, nodeno)?;
-            }
             return Ok(());
         }
 
