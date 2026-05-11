@@ -19,8 +19,9 @@
 //! - `MATCH` / `sqlite3_rtree_geometry_callback`-style geometry callbacks are not implemented.
 //! - `RTREE_COORD_INT32` (32-bit integer coordinates) is not implemented.
 //! - Row-count estimates from `sqlite_stat1` in `best_index` are not wired (static `best_index` has no table handle).
-//! - Leaf insert uses in-place splits; **internal** `SplitNode` when a reinserted pointer cell hits a full node
-//!   (`insert_internal_cell_at_height`) returns `Unimplemented`.
+//! - Internal `SplitNode` when a full node accepts a reinserted pointer is implemented for the non-root pattern that
+//!   matches leaf promotion (two new siblings + original node becomes internal). Recursive parent overflow is not
+//!   implemented (`rtreeInsertCell` into parent can still return `Unimplemented`).
 //! - Root collapse (`rtreeDeleteRowid` ~2978) queues cells at height `iDepth-1`; `descend_from_root_with_start` matches
 //!   SQLite `ChooseLeaf` descent counts (`iDepth - iHeight`).
 //! - When an **internal** node is underfull on delete, SQLite removes and reinserts subtree pointers; we only tighten.
@@ -524,8 +525,53 @@ impl RtreeTable {
         Ok(())
     }
 
-    /// Reinsert one internal pointer cell (`rtreeInsertCell` with `iHeight > 0` in `rtree.c`). Does not implement
-    /// internal `SplitNode` when the target node is full.
+    /// Split a **full** internal node by promoting it like [`insert_leaf_row`] does for leaves: allocate two child
+    /// nodes, move cells, reparent subtree roots in `%_parent`, then store two bounding cells in `split_nodeno`.
+    fn split_internal_node_and_promote(
+        &mut self,
+        conn: &Arc<Connection>,
+        split_nodeno: i64,
+        new_cell: &RtreeCell,
+    ) -> Result<(), ResultCode> {
+        let Some(target) = self.read_node(conn, split_nodeno)? else {
+            return Err(ResultCode::Corrupt);
+        };
+        let (left, right) = split_node(self, &target, new_cell, self.n_dim2);
+        self.node_count += 2;
+        let left_no = self.node_count - 1;
+        let right_no = self.node_count;
+
+        self.write_node(conn, left_no, &left)?;
+        self.write_node(conn, right_no, &right)?;
+
+        for i in 0..left.cell_count() {
+            let c = left.get_cell(self.n_dim2, self.n_bytes_per_cell, i);
+            self.write_parent_map(conn, c.rowid, left_no)?;
+        }
+        for i in 0..right.cell_count() {
+            let c = right.get_cell(self.n_dim2, self.n_bytes_per_cell, i);
+            self.write_parent_map(conn, c.rowid, right_no)?;
+        }
+
+        self.write_parent_map(conn, left_no, split_nodeno)?;
+        self.write_parent_map(conn, right_no, split_nodeno)?;
+
+        let cell_left = bounding_cell_for_child_node(self, &left, left_no, self.n_dim2);
+        let cell_right = bounding_cell_for_child_node(self, &right, right_no, self.n_dim2);
+
+        let mut internal = target;
+        internal.set_cell(self.n_dim2, self.n_bytes_per_cell, 0, &cell_left);
+        internal.set_cell(self.n_dim2, self.n_bytes_per_cell, 1, &cell_right);
+        internal.set_cell_count(2);
+        if split_nodeno == 1 {
+            internal.set_depth(internal.tree_depth() + 1);
+        }
+        self.write_node(conn, split_nodeno, &internal)?;
+        self.adjust_ancestry_mbr(conn, split_nodeno)?;
+        Ok(())
+    }
+
+    /// Reinsert one internal pointer cell (`rtreeInsertCell` with `iHeight > 0` in `rtree.c`).
     fn insert_internal_cell_at_height(
         &mut self,
         conn: &Arc<Connection>,
@@ -548,7 +594,7 @@ impl RtreeTable {
         let nodeno = target.node_no;
         let n = target.cell_count();
         if n >= self.max_cells() {
-            return Err(ResultCode::Unimplemented);
+            return self.split_internal_node_and_promote(conn, nodeno, cell);
         }
         target.set_cell(self.n_dim2, self.n_bytes_per_cell, n, cell);
         target.set_cell_count(n + 1);
