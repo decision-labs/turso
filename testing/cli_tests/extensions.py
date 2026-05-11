@@ -898,6 +898,36 @@ def test_rtree():
         lambda res: res == "1",
         "constraint scan hits the row",
     )
+    turso.run_test_fn(
+        "INSERT INTO rx VALUES (2, 20.0, 30.0, 20.0, 30.0);",
+        null,
+        "insert second row",
+    )
+    turso.run_test_fn(
+        "SELECT COUNT(*) FROM rx;",
+        lambda res: res.strip() == "2",
+        "rtree has two rows",
+    )
+    turso.run_test_fn(
+        "DELETE FROM rx WHERE id = 1;",
+        null,
+        "delete one row from rtree",
+    )
+    turso.run_test_fn(
+        "SELECT id FROM rx;",
+        lambda res: res.strip() == "2",
+        "remaining row id after delete",
+    )
+    turso.run_test_fn(
+        "UPDATE rx SET xmin = 21.0, xmax = 31.0, ymin = 21.0, ymax = 31.0 WHERE id = 2;",
+        null,
+        "update bounding box",
+    )
+    turso.run_test_fn(
+        "SELECT xmin FROM rx WHERE id = 2;",
+        lambda res: math.isclose(float(res.strip()), 21.0),
+        "updated xmin visible",
+    )
     turso.run_test_fn("DROP TABLE rx;", null, "drop rtree table")
     turso.quit()
 
