@@ -400,15 +400,91 @@ impl RtreeTable {
         Ok(())
     }
 
-    fn delete_shadow_node_row(&self, conn: &Arc<Connection>, nodeno: i64) -> Result<(), ResultCode> {
+    /// Leaf [`RtreeCell`] for `rowid` (geometry only; aux lives on `%_rowid`).
+    fn read_leaf_cell(&self, conn: &Arc<Connection>, rowid: i64) -> Result<RtreeCell, ResultCode> {
+        let Some(nodeno) = self.get_rowid_nodeno(conn, rowid)? else {
+            return Err(ResultCode::NotFound);
+        };
+        let Some(node) = self.read_node(conn, nodeno)? else {
+            return Err(ResultCode::Corrupt);
+        };
+        let idx = self
+            .find_cell_index(&node, rowid)
+            .ok_or(ResultCode::NotFound)?;
+        Ok(node.get_cell(self.n_dim2, self.n_bytes_per_cell, idx))
+    }
+
+    /// SQLite `xUpdate` supplies NULL in `argv[2..]` for unchanged columns; merge with the stored row
+    /// before delete+reinsert.
+    fn merge_xupdate_argv_with_existing_row(
+        &self,
+        conn: &Arc<Connection>,
+        old_rowid: i64,
+        args: &[Value],
+    ) -> Result<Vec<Value>, ResultCode> {
+        let required = self.n_dim2 + 1 + self.aux_columns.len();
+        if args.len() < required {
+            return Err(ResultCode::InvalidArgs);
+        }
+        let old_cell = self.read_leaf_cell(conn, old_rowid)?;
+        let old_aux = self.read_rowid_aux_values(conn, old_rowid)?;
+
+        let mut out = Vec::with_capacity(required);
+
+        let pk = if matches!(args[0].value_type(), ValueType::Null) {
+            Value::from_integer(old_rowid)
+        } else if let Some(id) = args[0].to_integer() {
+            Value::from_integer(id)
+        } else {
+            return Err(ResultCode::InvalidArgs);
+        };
+        out.push(pk);
+
+        for i in 0..self.n_dim2 {
+            let v = &args[i + 1];
+            let merged = if matches!(v.value_type(), ValueType::Null) {
+                Value::from_float(f64::from(old_cell.coords[i]))
+            } else if let Some(f) = v.to_float() {
+                Value::from_float(f)
+            } else {
+                return Err(ResultCode::InvalidArgs);
+            };
+            out.push(merged);
+        }
+
+        for j in 0..self.aux_columns.len() {
+            let v = &args[1 + self.n_dim2 + j];
+            let merged = if matches!(v.value_type(), ValueType::Null) {
+                value_to_owned(&old_aux[j])
+            } else {
+                value_to_owned(v)
+            };
+            out.push(merged);
+        }
+
+        Ok(out)
+    }
+
+    fn delete_shadow_node_row(
+        &self,
+        conn: &Arc<Connection>,
+        nodeno: i64,
+    ) -> Result<(), ResultCode> {
         let sql = format!("DELETE FROM {} WHERE nodeno = ?", self.shadow_node_table());
         conn.execute(&sql, &[Value::from_integer(nodeno)])
             .map_err(|_| ResultCode::Error)?;
         Ok(())
     }
 
-    fn delete_shadow_parent_row(&self, conn: &Arc<Connection>, nodeno: i64) -> Result<(), ResultCode> {
-        let sql = format!("DELETE FROM {} WHERE nodeno = ?", self.shadow_parent_table());
+    fn delete_shadow_parent_row(
+        &self,
+        conn: &Arc<Connection>,
+        nodeno: i64,
+    ) -> Result<(), ResultCode> {
+        let sql = format!(
+            "DELETE FROM {} WHERE nodeno = ?",
+            self.shadow_parent_table()
+        );
         conn.execute(&sql, &[Value::from_integer(nodeno)])
             .map_err(|_| ResultCode::Error)?;
         Ok(())
@@ -580,14 +656,9 @@ impl RtreeTable {
         let root = self.load_root_node(conn)?;
         let sqlite_depth = root.tree_depth().saturating_sub(1);
         let iterations = sqlite_depth.saturating_sub(cell_height);
-        let Some(mut target) = descend_from_root_with_start(
-            self,
-            Some(conn),
-            root,
-            cell,
-            self.n_dim2,
-            iterations,
-        ) else {
+        let Some(mut target) =
+            descend_from_root_with_start(self, Some(conn), root, cell, self.n_dim2, iterations)
+        else {
             return Err(ResultCode::Corrupt);
         };
         let nodeno = target.node_no;
@@ -685,9 +756,7 @@ impl RtreeTable {
             return Ok(());
         }
 
-        let child_no = root
-            .get_cell(self.n_dim2, self.n_bytes_per_cell, 0)
-            .rowid;
+        let child_no = root.get_cell(self.n_dim2, self.n_bytes_per_cell, 0).rowid;
         let Some(child) = self.read_node(conn, child_no)? else {
             return Err(ResultCode::Corrupt);
         };
@@ -1484,12 +1553,9 @@ impl VTable for RtreeTable {
         let Some(conn) = conn else {
             return Err(ResultCode::InvalidArgs);
         };
-        let required = self.n_dim2 + 1 + self.aux_columns.len();
-        if args.len() < required {
-            return Err(ResultCode::InvalidArgs);
-        }
+        let merged = self.merge_xupdate_argv_with_existing_row(&conn, old_rowid, args)?;
         self.delete(Some(conn.clone()), old_rowid)?;
-        self.insert(Some(conn), args)?;
+        self.insert(Some(conn), &merged)?;
         Ok(())
     }
 
@@ -1542,13 +1608,7 @@ impl VTable for RtreeTable {
                     self.write_node(&conn, nodeno, &node)?;
 
                     let mut depth_guard = 0;
-                    self.fix_after_cell_removal(
-                        &conn,
-                        nodeno,
-                        0,
-                        &mut pending,
-                        &mut depth_guard,
-                    )?;
+                    self.fix_after_cell_removal(&conn, nodeno, 0, &mut pending, &mut depth_guard)?;
                 }
             }
         }
@@ -1957,12 +2017,16 @@ impl VTabCursor for RtreeCursor {
 mod tests {
     use super::*;
 
-    fn new_table(args: Vec<&str>) -> RtreeTable {
-        let args = &args
+    fn create_table(args: Vec<&str>) -> (String, RtreeTable) {
+        let args: Vec<Value> = args
             .iter()
             .map(|s| Value::from_text(s.to_string()))
-            .collect::<Vec<_>>();
-        RtreeModule::create(args).unwrap().1
+            .collect();
+        RtreeModule::create(&args).unwrap()
+    }
+
+    fn new_table(args: Vec<&str>) -> RtreeTable {
+        create_table(args).1
     }
 
     #[test]
@@ -1982,6 +2046,50 @@ mod tests {
         ]);
         assert_eq!(table.n_dim2, 4);
         assert_eq!(table.aux_columns, vec!["label".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_aux_column_with_type_token() {
+        let table = new_table(vec![
+            "rtree",
+            "main",
+            "t",
+            "id",
+            "xmin",
+            "xmax",
+            "ymin",
+            "ymax",
+            "+label TEXT",
+        ]);
+        assert_eq!(table.aux_columns, vec!["label".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_multiple_aux_columns() {
+        let table = new_table(vec![
+            "rtree",
+            "main",
+            "t",
+            "id",
+            "xmin",
+            "xmax",
+            "ymin",
+            "ymax",
+            "+a",
+            "+b INTEGER",
+        ]);
+        assert_eq!(table.aux_columns, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_virtual_table_declaration_quotes_aux_identifiers() {
+        let (schema, _) = create_table(vec![
+            "rtree", "main", "test", "id", "xmin", "xmax", "ymin", "ymax", "+select",
+        ]);
+        assert!(
+            schema.contains("\"select\" TEXT"),
+            "aux schema must quote SQL keywords: {schema}"
+        );
     }
 
     #[test]
@@ -2115,7 +2223,8 @@ mod tests {
         ]);
         let cell = RtreeCell::new(42);
         let root = RtreeNode::new(1, 1, table.node_size);
-        let leaf = descend_from_root_with_start(&table, None, root, &cell, table.n_dim2, 0).unwrap();
+        let leaf =
+            descend_from_root_with_start(&table, None, root, &cell, table.n_dim2, 0).unwrap();
         assert_eq!(leaf.node_no, 1);
         assert_eq!(leaf.tree_depth(), 1);
     }

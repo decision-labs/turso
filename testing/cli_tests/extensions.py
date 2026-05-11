@@ -857,17 +857,35 @@ def test_sqlite_vfs_compat():
     sqlite.quit()
 
 
+def _cli_last_nonempty_line(res: str) -> str:
+    """Stable scalar parsing for REPL output (ignore leading stats/extra lines)."""
+    lines = [ln.strip() for ln in res.split("\n") if ln.strip()]
+    return lines[-1] if lines else ""
+
+
 def test_rtree():
     """Load rtree vtab, insert rows, and query with a range constraint."""
 
     def full_scan_ok(res: str) -> bool:
-        parts = [p.strip() for p in res.split("|")]
-        if len(parts) != 5:
-            return False
-        try:
-            return parts[0] == "1" and math.isclose(float(parts[1]), 0.0) and math.isclose(float(parts[2]), 10.0) and math.isclose(float(parts[3]), 0.0) and math.isclose(float(parts[4]), 10.0)
-        except ValueError:
-            return False
+        for raw_line in res.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) != 5:
+                continue
+            try:
+                if (
+                    parts[0] == "1"
+                    and math.isclose(float(parts[1]), 0.0)
+                    and math.isclose(float(parts[2]), 10.0)
+                    and math.isclose(float(parts[3]), 0.0)
+                    and math.isclose(float(parts[4]), 10.0)
+                ):
+                    return True
+            except ValueError:
+                continue
+        return False
 
     turso = TestTursoShell(init_commands="")
     ext_path = "./target/debug/liblimbo_rtree"
@@ -890,12 +908,12 @@ def test_rtree():
     )
     turso.run_test_fn(
         "SELECT id FROM rx WHERE xmin > 5.0 AND ymin > -1.0;",
-        lambda res: res == "",
+        lambda res: _cli_last_nonempty_line(res) == "",
         "no hit when query misses bbox",
     )
     turso.run_test_fn(
         "SELECT id FROM rx WHERE xmin > -1.0 AND xmax < 15.0 AND ymin > -1.0 AND ymax < 15.0;",
-        lambda res: res == "1",
+        lambda res: _cli_last_nonempty_line(res) == "1",
         "constraint scan hits the row",
     )
     turso.run_test_fn(
@@ -905,7 +923,7 @@ def test_rtree():
     )
     turso.run_test_fn(
         "SELECT COUNT(*) FROM rx;",
-        lambda res: res.strip() == "2",
+        lambda res: _cli_last_nonempty_line(res) == "2",
         "rtree has two rows",
     )
     turso.run_test_fn(
@@ -915,7 +933,7 @@ def test_rtree():
     )
     turso.run_test_fn(
         "SELECT id FROM rx;",
-        lambda res: res.strip() == "2",
+        lambda res: _cli_last_nonempty_line(res) == "2",
         "remaining row id after delete",
     )
     turso.run_test_fn(
@@ -925,10 +943,100 @@ def test_rtree():
     )
     turso.run_test_fn(
         "SELECT xmin FROM rx WHERE id = 2;",
-        lambda res: math.isclose(float(res.strip()), 21.0),
+        lambda res: math.isclose(float(_cli_last_nonempty_line(res)), 21.0),
         "updated xmin visible",
     )
     turso.run_test_fn("DROP TABLE rx;", null, "drop rtree table")
+    turso.quit()
+
+
+def test_rtree_aux():
+    """R-tree with auxiliary columns: persisted on shadow rowid and visible on SELECT."""
+
+    def row_ok(res: str) -> bool:
+        for raw_line in res.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) != 6:
+                continue
+            try:
+                if (
+                    parts[0] == "1"
+                    and math.isclose(float(parts[1]), 0.0)
+                    and math.isclose(float(parts[2]), 10.0)
+                    and math.isclose(float(parts[3]), 0.0)
+                    and math.isclose(float(parts[4]), 10.0)
+                    and parts[5] == "spot-a"
+                ):
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def spot_b_row_ok(res: str) -> bool:
+        for raw_line in res.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) != 6:
+                continue
+            try:
+                if (
+                    parts[0] == "1"
+                    and math.isclose(float(parts[1]), 0.0)
+                    and math.isclose(float(parts[2]), 10.0)
+                    and math.isclose(float(parts[3]), 0.0)
+                    and math.isclose(float(parts[4]), 10.0)
+                    and parts[5] == "spot-b"
+                ):
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    turso = TestTursoShell(init_commands="")
+    ext_path = "./target/debug/liblimbo_rtree"
+    test_module_list(turso, ext_path, "rtree")
+
+    turso.run_test_fn(
+        "CREATE VIRTUAL TABLE ry USING rtree(id, xmin, xmax, ymin, ymax, +label);",
+        null,
+        "create rtree with aux column",
+    )
+    turso.run_test_fn(
+        "INSERT INTO ry VALUES (1, 0.0, 10.0, 0.0, 10.0, 'spot-a');",
+        null,
+        "insert bbox and aux text",
+    )
+    turso.run_test_fn(
+        "SELECT id, xmin, xmax, ymin, ymax, label FROM ry;",
+        row_ok,
+        "full scan returns coords and aux",
+    )
+    turso.run_test_fn(
+        "SELECT label FROM ry WHERE id = 1;",
+        lambda res: _cli_last_nonempty_line(res) == "spot-a",
+        "rowid lookup reads aux from shadow rowid",
+    )
+    turso.run_test_fn(
+        "UPDATE ry SET label = 'spot-b' WHERE id = 1;",
+        null,
+        "partial update aux only (xUpdate NULL placeholders merged with stored row)",
+    )
+    turso.run_test_fn(
+        "SELECT id, xmin, xmax, ymin, ymax, label FROM ry;",
+        spot_b_row_ok,
+        "partial update preserves bbox coords",
+    )
+    turso.run_test_fn(
+        "SELECT label FROM ry WHERE id = 1;",
+        lambda res: _cli_last_nonempty_line(res) == "spot-b",
+        "updated aux visible",
+    )
+    turso.run_test_fn("DROP TABLE ry;", null, "drop aux rtree table")
     turso.quit()
 
 
@@ -1135,6 +1243,7 @@ def main():
         test_tablestats()
         test_fuzzy()
         test_rtree()
+        test_rtree_aux()
     except Exception as e:
         console.error(f"Test FAILED: {e}")
         cleanup()
