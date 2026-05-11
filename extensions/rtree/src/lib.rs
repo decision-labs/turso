@@ -19,9 +19,9 @@
 //! - `MATCH` / `sqlite3_rtree_geometry_callback`-style geometry callbacks are not implemented.
 //! - `RTREE_COORD_INT32` (32-bit integer coordinates) is not implemented.
 //! - Row-count estimates from `sqlite_stat1` in `best_index` are not wired (static `best_index` has no table handle).
-//! - Internal `SplitNode` when a full node accepts a reinserted pointer is implemented for the non-root pattern that
-//!   matches leaf promotion (two new siblings + original node becomes internal). Recursive parent overflow is not
-//!   implemented (`rtreeInsertCell` into parent can still return `Unimplemented`).
+//! - Internal full nodes use the same **promote-to-internal** split as leaf insert (two new siblings under the split
+//!   nodeno). SQLite's alternate `SplitNode` path (`pLeft = pNode`, then `rtreeInsertCell` into the parent for the
+//!   right bbox, which may overflow the parent) is not implemented.
 //! - Root collapse (`rtreeDeleteRowid` ~2978) queues cells at height `iDepth-1`; `descend_from_root_with_start` matches
 //!   SQLite `ChooseLeaf` descent counts (`iDepth - iHeight`).
 
@@ -2104,6 +2104,20 @@ mod tests {
         let cell = RtreeCell::new(1);
         let leaf = choose_leaf(&table, None, &cell, 4);
         assert!(leaf.is_some());
+    }
+
+    /// With `tree_depth == 1` on the root blob, `ChooseLeaf` runs `tree_depth - 1 == 0` descent steps (SQLite `iDepth`
+    /// mapping): the chosen node stays the root.
+    #[test]
+    fn test_choose_leaf_zero_descent_when_single_tree_level() {
+        let table = new_table(vec![
+            "rtree", "main", "test", "id", "xmin", "xmax", "ymin", "ymax",
+        ]);
+        let cell = RtreeCell::new(42);
+        let root = RtreeNode::new(1, 1, table.node_size);
+        let leaf = descend_from_root_with_start(&table, None, root, &cell, table.n_dim2, 0).unwrap();
+        assert_eq!(leaf.node_no, 1);
+        assert_eq!(leaf.tree_depth(), 1);
     }
 
     #[test]
