@@ -16,6 +16,17 @@ pub(crate) enum VirtualTableType {
     Internal(Arc<RwLock<dyn InternalVirtualTable>>),
 }
 
+/// Build the `xCreate` argv prefix: `[module_name, db_name, table_name]`. Extensions receive these as the first
+/// three elements of `args`, followed by the parenthesized `USING(...)` arguments. `db_name` is hardcoded to
+/// `"main"` because turso has no attached-database concept on the vtab path today.
+fn ext_create_argv(module_name: &str, table_name: &str) -> Vec<turso_ext::Value> {
+    vec![
+        turso_ext::Value::from_text(module_name.to_string()),
+        turso_ext::Value::from_text("main".to_string()),
+        turso_ext::Value::from_text(table_name.to_string()),
+    ]
+}
+
 #[derive(Clone, Debug)]
 pub struct VirtualTable {
     pub(crate) name: String,
@@ -155,7 +166,8 @@ impl VirtualTable {
     pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_modules.get(name);
         let (vtab_type, schema) = if module.is_some() {
-            ExtVirtualTable::create(name, module, Vec::new(), VTabKind::TableValuedFunction)
+            let args = ext_create_argv(name, name);
+            ExtVirtualTable::create(name, module, args, VTabKind::TableValuedFunction)
                 .map(|(vtab, columns)| (VirtualTableType::External(vtab), columns))?
         } else {
             return Err(LimboError::ParseError(format!(
@@ -181,10 +193,13 @@ impl VirtualTable {
         syms: &SymbolTable,
     ) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_modules.get(module_name);
+        let resolved_name = tbl_name.unwrap_or(module_name);
+        let mut argv = ext_create_argv(module_name, resolved_name);
+        argv.extend(args);
         let (table, schema) =
-            ExtVirtualTable::create(module_name, module, args, VTabKind::VirtualTable)?;
+            ExtVirtualTable::create(module_name, module, argv, VTabKind::VirtualTable)?;
         let vtab = VirtualTable {
-            name: tbl_name.unwrap_or(module_name).to_owned(),
+            name: resolved_name.to_owned(),
             columns: Self::resolve_columns(schema)?,
             kind: VTabKind::VirtualTable,
             vtab_type: VirtualTableType::External(table),
@@ -610,6 +625,10 @@ impl ExtVirtualTableCursor {
         unsafe { (self.implementation.rowid)(self.cursor.as_ptr()) }
     }
 
+    fn eof(&self) -> bool {
+        unsafe { (self.implementation.eof)(self.cursor.as_ptr()) }
+    }
+
     #[tracing::instrument(skip(self))]
     fn filter(
         &self,
@@ -644,8 +663,10 @@ impl ExtVirtualTableCursor {
                 arg.__free_internal_type();
             }
         }
+        // `xFilter` returning EOF is treated as "no rows" rather than an error to keep the older convention working.
+        // For SQLite-style extensions that always return OK, the authoritative empty-cursor signal is `xEof()`.
         match rc {
-            ResultCode::OK => Ok(true),
+            ResultCode::OK => Ok(!self.eof()),
             ResultCode::EOF => Ok(false),
             _ => Err(LimboError::ExtensionError(rc.to_string())),
         }
@@ -659,7 +680,7 @@ impl ExtVirtualTableCursor {
     fn next(&self) -> crate::Result<bool> {
         let rc = unsafe { (self.implementation.next)(self.cursor.as_ptr()) };
         match rc {
-            ResultCode::OK => Ok(true),
+            ResultCode::OK => Ok(!self.eof()),
             ResultCode::EOF => Ok(false),
             _ => Err(LimboError::ExtensionError("Next failed".to_string())),
         }

@@ -111,7 +111,10 @@ impl VTabModule for CsvVTabModule {
     const READONLY: bool = true;
 
     fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
-        if args.is_empty() {
+        // `args[0..3]` is the xCreate prefix `[module, db, table]`; CSV only consumes the parenthesized
+        // `USING(...)` arguments that follow.
+        let using_args = args.get(3..).unwrap_or(&[]);
+        if using_args.is_empty() {
             return Err(ResultCode::InvalidArgs);
         }
 
@@ -121,7 +124,7 @@ impl VTabModule for CsvVTabModule {
         let mut column_count = None;
         let mut header = None;
 
-        for arg in args {
+        for arg in using_args {
             let (name, value) = Self::parse_arg(arg)?;
             match name {
                 "filename" => {
@@ -385,11 +388,14 @@ mod tests {
     }
 
     fn try_new_table(args: Vec<&str>) -> Result<(String, CsvTable), ResultCode> {
-        let args = &args
-            .iter()
-            .map(|s| Value::from_text(s.to_string()))
-            .collect::<Vec<_>>();
-        CsvVTabModule::create(args)
+        // The xCreate ABI requires `[module, db, table]` before the `USING(...)` args.
+        let mut full: Vec<Value> = vec![
+            Value::from_text("csv".to_string()),
+            Value::from_text("main".to_string()),
+            Value::from_text("t".to_string()),
+        ];
+        full.extend(args.iter().map(|s| Value::from_text(s.to_string())));
+        CsvVTabModule::create(&full)
     }
 
     fn read_rows(mut cursor: CsvCursor, column_count: u32) -> Vec<Vec<Option<String>>> {

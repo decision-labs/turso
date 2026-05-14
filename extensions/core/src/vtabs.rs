@@ -139,8 +139,16 @@ pub trait VTabModule: 'static {
     const NAME: &'static str;
     const READONLY: bool = true;
 
-    /// Creates a new instance of a virtual table.
-    /// Returns a tuple where the first element is the table's schema.
+    /// Creates a new instance of a virtual table. Returns a tuple where the first element is the table's schema.
+    ///
+    /// `args` is laid out as:
+    /// - `args[0]` — module name (e.g. `"rtree"`, `"csv"`).
+    /// - `args[1]` — database name (currently always `"main"`; attached DBs aren't wired here yet).
+    /// - `args[2]` — table name as given by the user in `CREATE VIRTUAL TABLE <name> USING ...`.
+    /// - `args[3..]` — the parenthesized arguments from the `USING(...)` clause.
+    ///
+    /// Extensions that only need the `USING` arguments should iterate `args[3..]`; those that need the user-visible
+    /// table name (e.g. for shadow-table naming like `<table>_node`) read `args[2]`.
     fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode>;
 }
 

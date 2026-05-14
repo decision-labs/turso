@@ -153,10 +153,10 @@ impl GenerateSeriesCursor {
         self.is_invalid_ascending_series() || self.is_invalid_descending_series()
     }
 
-    /// Returns true if we would exceed the stop value in the current direction
-    fn would_exceed(&self) -> bool {
-        (self.step > 0 && self.current.saturating_add(self.step) > self.stop)
-            || (self.step < 0 && self.current.saturating_add(self.step) < self.stop)
+    /// True iff the cursor has advanced past the last valid row in its direction.
+    fn current_past_stop(&self) -> bool {
+        (self.step > 0 && self.current > self.stop)
+            || (self.step < 0 && self.current < self.stop)
     }
 }
 
@@ -223,36 +223,34 @@ impl VTabCursor for GenerateSeriesCursor {
             return ResultCode::EOF;
         }
 
-        self.current = match self.current.checked_add(self.step) {
-            Some(val) => val,
-            None => {
-                return ResultCode::EOF;
+        // Advance, then check whether the new value is still a valid row. If not, leave `current` at the
+        // post-stop value so `eof()` reports past-end and surface EOF directly for callers that only consult the
+        // return code.
+        match self.current.checked_add(self.step) {
+            Some(next) => {
+                self.current = next;
+                if self.current_past_stop() {
+                    ResultCode::EOF
+                } else {
+                    ResultCode::OK
+                }
             }
-        };
-
-        ResultCode::OK
+            None => {
+                // Saturate so `eof()` reports past-end after the overflow.
+                self.current = if self.step > 0 { i64::MAX } else { i64::MIN };
+                ResultCode::EOF
+            }
+        }
     }
 
     fn eof(&self) -> bool {
-        // Check for invalid ranges (empty series) first
+        // Check for invalid ranges (empty series) first.
         if self.is_invalid_range() {
             return true;
         }
 
-        // Check if we would exceed the stop value in the current direction
-        if self.would_exceed() {
-            return true;
-        }
-
-        if self.current == i64::MAX && self.step > 0 {
-            return true;
-        }
-
-        if self.current == i64::MIN && self.step < 0 {
-            return true;
-        }
-
-        false
+        // Past the last valid row in the current direction.
+        self.current_past_stop()
     }
 
     fn column(&self, idx: u32) -> Result<Value, Self::Error> {
