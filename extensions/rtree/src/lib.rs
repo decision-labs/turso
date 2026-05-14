@@ -1,7 +1,7 @@
 //! R-Tree virtual table extension.
 //!
 //! A Rust implementation of SQLite's rtree extension for spatial indexing.
-//! Uses the R-Tree algorithm from Guttman[1984].
+//! Uses the R*-tree split heuristic from Beckmann et al. 1990 (see [`split_node`]).
 //!
 //! ## Usage:
 //!
@@ -24,6 +24,13 @@
 //!   right bbox, which may overflow the parent) is not implemented.
 //! - Root collapse (`rtreeDeleteRowid` ~2978) queues cells at height `iDepth-1`; `descend_from_root_with_start` matches
 //!   SQLite `ChooseLeaf` descent counts (`iDepth - iHeight`).
+//!
+//! ## Split algorithm
+//!
+//! [`split_node`] mirrors SQLite's `splitNodeStartree` (Beckmann et al. 1990): for each dimension, sort cells by
+//! `(min, max)`, scan candidate split points `[MINCELLS..=N-MINCELLS]`, pick the axis with minimum total margin, and
+//! within that axis pick the distribution with minimum overlap (tiebreak: total area). For tiny inputs
+//! (`N < 2 * MINCELLS`) — only reachable from unit tests today — we fall back to a halving split.
 
 use std::sync::Arc;
 use turso_ext::{
@@ -557,10 +564,7 @@ impl RtreeTable {
                 self.write_node(conn, nodeno, &leaf)?;
                 nodeno
             } else {
-                let n_total = n_cells + 1;
-                let mid = (n_total + 1) / 2;
-                let new_idx = n_total - 1;
-                let (left, right) = split_node(self, &leaf, cell, self.n_dim2);
+                let (left, right, new_in_right) = split_node(self, &leaf, cell, self.n_dim2);
                 self.node_count += 2;
                 let left_no = self.node_count - 1;
                 let right_no = self.node_count;
@@ -578,10 +582,10 @@ impl RtreeTable {
                     leaf.set_depth(leaf.tree_depth() + 1);
                 }
                 self.write_node(conn, nodeno, &leaf)?;
-                if new_idx < mid {
-                    left_no
-                } else {
+                if new_in_right {
                     right_no
+                } else {
+                    left_no
                 }
             }
         } else {
@@ -611,7 +615,7 @@ impl RtreeTable {
         let Some(target) = self.read_node(conn, split_nodeno)? else {
             return Err(ResultCode::Corrupt);
         };
-        let (left, right) = split_node(self, &target, new_cell, self.n_dim2);
+        let (left, right, _new_in_right) = split_node(self, &target, new_cell, self.n_dim2);
         self.node_count += 2;
         let left_no = self.node_count - 1;
         let right_no = self.node_count;
@@ -1387,64 +1391,175 @@ fn choose_leaf(
     descend_from_root_with_start(table, conn, root, cell, n_dim2, iterations)
 }
 
+/// Sum of `(max - min)` across every dimension (SQLite `cellMargin`).
+fn cell_margin(cell: &RtreeCell, n_dim2: usize) -> f64 {
+    let n_dim = n_dim2 / 2;
+    let mut margin = 0.0f64;
+    for j in 0..n_dim {
+        margin += (cell.coords[2 * j + 1] - cell.coords[2 * j]) as f64;
+    }
+    margin
+}
+
+/// Product of `(max - min)` across every dimension (SQLite `cellArea`).
+fn cell_area(cell: &RtreeCell, n_dim2: usize) -> f64 {
+    let n_dim = n_dim2 / 2;
+    let mut area = 1.0f64;
+    for j in 0..n_dim {
+        area *= (cell.coords[2 * j + 1] - cell.coords[2 * j]) as f64;
+    }
+    area
+}
+
+/// Volume of `a ∩ b`. Zero if disjoint in any dimension (SQLite `cellOverlap` with `nCell == 1`).
+fn cell_pair_overlap_volume(a: &RtreeCell, b: &RtreeCell, n_dim2: usize) -> f64 {
+    let n_dim = n_dim2 / 2;
+    let mut o = 1.0f64;
+    for j in 0..n_dim {
+        let lo = a.coords[2 * j].max(b.coords[2 * j]) as f64;
+        let hi = a.coords[2 * j + 1].min(b.coords[2 * j + 1]) as f64;
+        if hi < lo {
+            return 0.0;
+        }
+        o *= hi - lo;
+    }
+    o
+}
+
+/// R*-tree split (SQLite `splitNodeStartree`): pick the axis with minimum total margin, then within that axis the
+/// split point with minimum overlap (tiebreak: area). The returned `bool` is `true` iff the freshly inserted `cell`
+/// ended up in the right child — callers that need to follow the new cell (leaf insert, internal pointer reinsert)
+/// use it to choose the next nodeno.
 fn split_node(
     table: &RtreeTable,
     node: &RtreeNode,
     cell: &RtreeCell,
     n_dim2: usize,
-) -> (RtreeNode, RtreeNode) {
-    let mut left_node = RtreeNode::new(0, node.depth, table.node_size);
-    let mut right_node = RtreeNode::new(0, node.depth, table.node_size);
-
-    let n_cells = node.cell_count();
-    let mut cells: Vec<RtreeCell> = (0..n_cells)
+) -> (RtreeNode, RtreeNode, bool) {
+    let mut cells: Vec<RtreeCell> = (0..node.cell_count())
         .map(|i| node.get_cell(n_dim2, table.n_bytes_per_cell, i))
         .collect();
+    let new_cell_orig_idx = cells.len();
     cells.push(cell.clone());
-
     let n_total = cells.len();
-    let mid = (n_total + 1) / 2;
+    let n_dim = n_dim2 / 2;
+    let min_cells = table.min_cells().max(1);
 
-    let mut left_min = [f32::MAX; RTREE_MAX_DIMENSIONS];
-    let mut left_max = [f32::MIN; RTREE_MAX_DIMENSIONS];
-    let mut right_min = [f32::MAX; RTREE_MAX_DIMENSIONS];
-    let mut right_max = [f32::MIN; RTREE_MAX_DIMENSIONS];
+    // SQLite's loop requires nLeft in [MINCELLS, nCell-MINCELLS]. For tiny inputs (only unit tests today) we fall
+    // back to a halving split with the original (unsorted) cell order.
+    if n_total < 2 * min_cells {
+        let split_at = n_total.div_ceil(2).max(1).min(n_total);
+        return build_split_children(
+            table,
+            node.depth,
+            n_dim2,
+            &cells,
+            &(0..n_total).collect::<Vec<_>>(),
+            split_at,
+            new_cell_orig_idx,
+        );
+    }
 
-    for i in 0..mid {
-        for j in 0..n_dim2 {
-            left_min[j] = left_min[j].min(cells[i].coords[j]);
-            left_min[j] = left_min[j].min(cells[i].coords[n_dim2 + j]);
-            left_max[j] = left_max[j].max(cells[i].coords[j]);
-            left_max[j] = left_max[j].max(cells[i].coords[n_dim2 + j]);
+    let mut best_split = min_cells;
+    let mut best_margin_sum = f64::INFINITY;
+    let mut best_order: Vec<usize> = (0..n_total).collect();
+    let mut best_dim_seen = false;
+
+    for d in 0..n_dim {
+        let mut idx: Vec<usize> = (0..n_total).collect();
+        // SQLite `SortByDimension`: primary key is min coord on dim d, tiebreak by max coord on dim d.
+        idx.sort_by(|&a, &b| {
+            let a_lo = cells[a].coords[2 * d];
+            let b_lo = cells[b].coords[2 * d];
+            match a_lo.partial_cmp(&b_lo) {
+                Some(std::cmp::Ordering::Equal) | None => {
+                    let a_hi = cells[a].coords[2 * d + 1];
+                    let b_hi = cells[b].coords[2 * d + 1];
+                    a_hi.partial_cmp(&b_hi).unwrap_or(std::cmp::Ordering::Equal)
+                }
+                Some(ord) => ord,
+            }
+        });
+
+        let mut margin_sum = 0.0f64;
+        let mut best_overlap_for_dim = f64::INFINITY;
+        let mut best_area_for_dim = f64::INFINITY;
+        let mut best_split_for_dim = min_cells;
+
+        for n_left in min_cells..=(n_total - min_cells) {
+            let mut left = cells[idx[0]].clone();
+            for k in 1..n_left {
+                left = cell_union_mbr_coords(&left, &cells[idx[k]], n_dim2);
+            }
+            let mut right = cells[idx[n_left]].clone();
+            for k in (n_left + 1)..n_total {
+                right = cell_union_mbr_coords(&right, &cells[idx[k]], n_dim2);
+            }
+
+            margin_sum += cell_margin(&left, n_dim2) + cell_margin(&right, n_dim2);
+            let overlap = cell_pair_overlap_volume(&left, &right, n_dim2);
+            let area = cell_area(&left, n_dim2) + cell_area(&right, n_dim2);
+
+            let take = n_left == min_cells
+                || overlap < best_overlap_for_dim
+                || (overlap == best_overlap_for_dim && area < best_area_for_dim);
+            if take {
+                best_split_for_dim = n_left;
+                best_overlap_for_dim = overlap;
+                best_area_for_dim = area;
+            }
+        }
+
+        if !best_dim_seen || margin_sum < best_margin_sum {
+            best_dim_seen = true;
+            best_margin_sum = margin_sum;
+            best_split = best_split_for_dim;
+            best_order = idx;
         }
     }
 
-    for i in mid..n_total {
-        for j in 0..n_dim2 {
-            right_min[j] = right_min[j].min(cells[i].coords[j]);
-            right_min[j] = right_min[j].min(cells[i].coords[n_dim2 + j]);
-            right_max[j] = right_max[j].max(cells[i].coords[j]);
-            right_max[j] = right_max[j].max(cells[i].coords[n_dim2 + j]);
-        }
-    }
+    build_split_children(
+        table,
+        node.depth,
+        n_dim2,
+        &cells,
+        &best_order,
+        best_split,
+        new_cell_orig_idx,
+    )
+}
 
+fn build_split_children(
+    table: &RtreeTable,
+    node_depth: usize,
+    n_dim2: usize,
+    cells: &[RtreeCell],
+    order: &[usize],
+    split_at: usize,
+    new_cell_orig_idx: usize,
+) -> (RtreeNode, RtreeNode, bool) {
+    let mut left_node = RtreeNode::new(0, node_depth, table.node_size);
+    let mut right_node = RtreeNode::new(0, node_depth, table.node_size);
     let mut left_count = 0;
     let mut right_count = 0;
+    let mut new_in_right = false;
 
-    for (i, c) in cells.iter().enumerate() {
-        if i < mid {
-            left_node.set_cell(n_dim2, table.n_bytes_per_cell, left_count, c);
+    for (sorted_pos, &ci) in order.iter().enumerate() {
+        if sorted_pos < split_at {
+            left_node.set_cell(n_dim2, table.n_bytes_per_cell, left_count, &cells[ci]);
             left_count += 1;
         } else {
-            right_node.set_cell(n_dim2, table.n_bytes_per_cell, right_count, c);
+            right_node.set_cell(n_dim2, table.n_bytes_per_cell, right_count, &cells[ci]);
             right_count += 1;
+            if ci == new_cell_orig_idx {
+                new_in_right = true;
+            }
         }
     }
 
     left_node.set_cell_count(left_count);
     right_node.set_cell_count(right_count);
-
-    (left_node, right_node)
+    (left_node, right_node, new_in_right)
 }
 
 /// Bounding box for all entries in `node`, stored as an internal-node cell referencing child `child_nodeno`.
@@ -1621,7 +1736,9 @@ impl VTable for RtreeTable {
                 if h == 0 {
                     let aux = match self.read_rowid_aux_values(&conn, c.rowid) {
                         Ok(a) => a,
-                        Err(ResultCode::NotFound) => vec![Value::null(); self.aux_columns.len()],
+                        Err(ResultCode::NotFound) => (0..self.aux_columns.len())
+                            .map(|_| Value::null())
+                            .collect(),
                         Err(e) => return Err(e),
                     };
                     self.insert_leaf_row(&conn, c.rowid, &c, &aux)?;
@@ -2238,9 +2355,105 @@ mod tests {
         node.set_cell_count(0);
 
         let cell = RtreeCell::new(1);
-        let (left, right) = split_node(&table, &node, &cell, 4);
+        let (left, right, _) = split_node(&table, &node, &cell, 4);
 
         assert!(left.cell_count() > 0 || right.cell_count() > 0);
+    }
+
+    /// Two well-separated clusters on the X axis — the R*-tree heuristic must group them on that axis with zero
+    /// overlap, regardless of the order cells were appended. Verifies parity with SQLite `splitNodeStartree`.
+    #[test]
+    fn test_split_node_groups_clusters_zero_overlap() {
+        let table = new_table(vec![
+            "rtree", "main", "test", "id", "xmin", "xmax", "ymin", "ymax",
+        ]);
+        let n_dim2 = 4;
+        let n_bytes = table.n_bytes_per_cell;
+        let mut node = RtreeNode::new(1, 0, table.node_size);
+
+        // Force the per-axis loop to run (need N >= 2 * min_cells). Build alternating cluster cells.
+        let m = (table.min_cells() * 2 + 2).max(8);
+        let left_cluster_count = m / 2;
+        let mut count = 0;
+        for i in 0..left_cluster_count {
+            // Left cluster: x in [0, 1], y wandering over [0, 100].
+            let mut c = RtreeCell::new((i as i64) + 1);
+            c.coords[0] = 0.0;
+            c.coords[1] = 1.0;
+            c.coords[2] = i as f32;
+            c.coords[3] = (i as f32) + 0.5;
+            node.set_cell(n_dim2, n_bytes, count, &c);
+            count += 1;
+        }
+        let right_cluster_count = m - 1 - left_cluster_count;
+        for i in 0..right_cluster_count {
+            // Right cluster: x in [100, 101], y wandering.
+            let mut c = RtreeCell::new((left_cluster_count + i + 1) as i64);
+            c.coords[0] = 100.0;
+            c.coords[1] = 101.0;
+            c.coords[2] = i as f32;
+            c.coords[3] = (i as f32) + 0.5;
+            node.set_cell(n_dim2, n_bytes, count, &c);
+            count += 1;
+        }
+        node.set_cell_count(count);
+
+        // The new cell joins the right cluster.
+        let mut new_cell = RtreeCell::new(9999);
+        new_cell.coords[0] = 100.5;
+        new_cell.coords[1] = 101.0;
+        new_cell.coords[2] = 0.0;
+        new_cell.coords[3] = 0.5;
+
+        let (left, right, new_in_right) = split_node(&table, &node, &new_cell, n_dim2);
+        assert!(left.cell_count() >= table.min_cells());
+        assert!(right.cell_count() >= table.min_cells());
+
+        let left_bbox = union_mbr_of_node_cells(&table, &left, n_dim2).unwrap();
+        let right_bbox = union_mbr_of_node_cells(&table, &right, n_dim2).unwrap();
+        // Disjoint MBRs on the X axis prove the split picked the right partition.
+        assert!(
+            left_bbox.coords[1] < right_bbox.coords[0]
+                || right_bbox.coords[1] < left_bbox.coords[0],
+            "expected disjoint X projections after R*-tree split: left=[{},{}], right=[{},{}]",
+            left_bbox.coords[0],
+            left_bbox.coords[1],
+            right_bbox.coords[0],
+            right_bbox.coords[1],
+        );
+        assert!(
+            new_in_right,
+            "new cell from the right cluster should land in right child"
+        );
+    }
+
+    #[test]
+    fn test_cell_pair_overlap_volume_disjoint_and_nested() {
+        let mut a = RtreeCell::new(1);
+        a.coords[0] = 0.0;
+        a.coords[1] = 1.0;
+        a.coords[2] = 0.0;
+        a.coords[3] = 1.0;
+
+        let mut b = RtreeCell::new(2);
+        b.coords[0] = 2.0;
+        b.coords[1] = 3.0;
+        b.coords[2] = 0.0;
+        b.coords[3] = 1.0;
+        // Disjoint on x.
+        assert_eq!(cell_pair_overlap_volume(&a, &b, 4), 0.0);
+
+        let mut c = RtreeCell::new(3);
+        c.coords[0] = 0.25;
+        c.coords[1] = 0.75;
+        c.coords[2] = 0.25;
+        c.coords[3] = 0.75;
+        // Nested inside a: overlap = 0.5 * 0.5 = 0.25.
+        let o = cell_pair_overlap_volume(&a, &c, 4);
+        assert!((o - 0.25).abs() < 1e-6, "got {o}");
+
+        assert!((cell_margin(&a, 4) - 2.0).abs() < 1e-6);
+        assert!((cell_area(&a, 4) - 1.0).abs() < 1e-6);
     }
 
     #[test]
