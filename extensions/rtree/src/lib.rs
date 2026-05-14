@@ -31,6 +31,13 @@
 //! `(min, max)`, scan candidate split points `[MINCELLS..=N-MINCELLS]`, pick the axis with minimum total margin, and
 //! within that axis pick the distribution with minimum overlap (tiebreak: total area). For tiny inputs
 //! (`N < 2 * MINCELLS`) — only reachable from unit tests today — we fall back to a halving split.
+//!
+//! ## Integrity check
+//!
+//! [`RtreeTable::integrity_check`] ports SQLite's `rtreecheck` (`ext/rtree/rtree.c` ~3831): per-cell `min ≤ max`,
+//! containment within parent MBR, `%_rowid` / `%_parent` mapping correctness, and shadow-table count parity. It is
+//! **not yet wired to SQL** — turso_ext scalar functions don't receive a `Connection`, so a SQL-callable
+//! `rtreecheck()` cannot be registered today; the pure-geometry slice is unit-tested via [`RtreeTable::check_cell_geometry`].
 
 use std::sync::Arc;
 use turso_ext::{
@@ -944,7 +951,205 @@ impl RtreeTable {
         node.set_cell_count(n_cells - 1);
         node.is_dirty = true;
     }
+
+    fn shadow_table_row_count(
+        &self,
+        conn: &Arc<Connection>,
+        table: &str,
+    ) -> Result<i64, ResultCode> {
+        let sql = format!("SELECT count(*) FROM {table}");
+        let mut stmt = conn.prepare(&sql).map_err(|_| ResultCode::Error)?;
+        if stmt.step() == StepResult::Row {
+            if let Some(v) = stmt.get_row().first() {
+                return Ok(v.to_integer().unwrap_or(0));
+            }
+        }
+        Ok(0)
+    }
+
+    /// Mirror of SQLite `rtreecheck` (`ext/rtree/rtree.c` ~3831). Returns one message per problem found, capped at
+    /// [`RTREE_CHECK_MAX_ERRORS`]; an empty `Vec` means the tree is internally consistent. Verifies:
+    ///   1. every cell has `min ≤ max` per dim
+    ///   2. every non-root cell is bounded by its parent's MBR
+    ///   3. each leaf rowid has a `%_rowid → nodeno` mapping pointing at the cell's node
+    ///   4. each internal pointer has a `%_parent → parentnode` mapping pointing at the cell's node
+    ///   5. `count(%_rowid) == #leaf cells` and `count(%_parent) == #non-leaf cells`
+    ///
+    /// Not yet wired to SQL: `turso_ext` scalar functions don't receive a `Connection`, so a SQL-callable
+    /// `rtreecheck()` cannot be registered today. Exercised indirectly via the Python CLI integration test, which
+    /// asserts the same invariants on the live shadow tables after CRUD sequences.
+    #[allow(dead_code)]
+    pub fn integrity_check(&self, conn: &Arc<Connection>) -> Result<Vec<String>, ResultCode> {
+        let mut report: Vec<String> = Vec::new();
+        let mut n_leaf: i64 = 0;
+        let mut n_nonleaf: i64 = 0;
+
+        let root = match self.read_node(conn, 1)? {
+            Some(node) => node,
+            None => {
+                report.push("Node 1 missing from database".to_string());
+                return Ok(report);
+            }
+        };
+        let root_depth = root.tree_depth();
+        self.check_node_recursive(
+            conn,
+            &root,
+            root_depth,
+            None,
+            &mut report,
+            &mut n_leaf,
+            &mut n_nonleaf,
+        )?;
+
+        if report.len() < RTREE_CHECK_MAX_ERRORS {
+            let actual_rowids = self.shadow_table_row_count(conn, &self.shadow_rowid_table())?;
+            if actual_rowids != n_leaf {
+                report.push(format!(
+                    "Wrong number of entries in %_rowid table - expected {n_leaf}, actual {actual_rowids}"
+                ));
+            }
+        }
+        if report.len() < RTREE_CHECK_MAX_ERRORS {
+            let actual_parents = self.shadow_table_row_count(conn, &self.shadow_parent_table())?;
+            if actual_parents != n_nonleaf {
+                report.push(format!(
+                    "Wrong number of entries in %_parent table - expected {n_nonleaf}, actual {actual_parents}"
+                ));
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Pure-geometry slice of [`integrity_check`]: append per-cell coord errors (`min > max` per dim and, when
+    /// `parent_bbox` is `Some`, "out of parent" errors). No connection required — split out so unit tests can drive
+    /// the geometry rules without spinning up a database.
+    fn check_cell_geometry(
+        &self,
+        nodeno: i64,
+        cell_idx: usize,
+        cell: &RtreeCell,
+        parent_bbox: Option<&RtreeCell>,
+        report: &mut Vec<String>,
+    ) {
+        for d in 0..(self.n_dim2 / 2) {
+            if cell.coords[2 * d] > cell.coords[2 * d + 1] {
+                report.push(format!(
+                    "Dimension {d} of cell {cell_idx} on node {nodeno} is corrupt"
+                ));
+                if report.len() >= RTREE_CHECK_MAX_ERRORS {
+                    return;
+                }
+            }
+        }
+        if let Some(parent) = parent_bbox {
+            for d in 0..(self.n_dim2 / 2) {
+                let pc_lo = parent.coords[2 * d];
+                let pc_hi = parent.coords[2 * d + 1];
+                let c_lo = cell.coords[2 * d];
+                let c_hi = cell.coords[2 * d + 1];
+                if c_lo < pc_lo || c_hi > pc_hi {
+                    report.push(format!(
+                        "Dimension {d} of cell {cell_idx} on node {nodeno} is corrupt relative to parent"
+                    ));
+                    if report.len() >= RTREE_CHECK_MAX_ERRORS {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn check_node_recursive(
+        &self,
+        conn: &Arc<Connection>,
+        node: &RtreeNode,
+        depth: usize,
+        parent_bbox: Option<&RtreeCell>,
+        report: &mut Vec<String>,
+        n_leaf: &mut i64,
+        n_nonleaf: &mut i64,
+    ) -> Result<(), ResultCode> {
+        if report.len() >= RTREE_CHECK_MAX_ERRORS {
+            return Ok(());
+        }
+
+        let n_cells = node.cell_count();
+        let is_leaf = depth == 0;
+
+        for i in 0..n_cells {
+            let cell = node.get_cell(self.n_dim2, self.n_bytes_per_cell, i);
+            self.check_cell_geometry(node.node_no, i, &cell, parent_bbox, report);
+            if report.len() >= RTREE_CHECK_MAX_ERRORS {
+                return Ok(());
+            }
+
+            if is_leaf {
+                *n_leaf += 1;
+                // Check 3: %_rowid maps cell.rowid -> node.node_no.
+                match self.get_rowid_nodeno(conn, cell.rowid)? {
+                    None => {
+                        report.push(format!(
+                            "Mapping ({} -> {}) missing from %_rowid table",
+                            cell.rowid, node.node_no
+                        ));
+                    }
+                    Some(stored) if stored != node.node_no => {
+                        report.push(format!(
+                            "Found ({} -> {stored}) in %_rowid table, expected ({} -> {})",
+                            cell.rowid, cell.rowid, node.node_no
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            } else {
+                *n_nonleaf += 1;
+                // Check 4: %_parent maps child_nodeno -> node.node_no.
+                let child_no = cell.rowid;
+                match self.get_parent_nodeno(conn, child_no)? {
+                    None => {
+                        report.push(format!(
+                            "Mapping ({child_no} -> {}) missing from %_parent table",
+                            node.node_no
+                        ));
+                    }
+                    Some(stored) if stored != node.node_no => {
+                        report.push(format!(
+                            "Found ({child_no} -> {stored}) in %_parent table, expected ({child_no} -> {})",
+                            node.node_no
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                // Descend.
+                if let Some(child) = self.read_node(conn, child_no)? {
+                    let next_depth = depth.saturating_sub(1);
+                    self.check_node_recursive(
+                        conn,
+                        &child,
+                        next_depth,
+                        Some(&cell),
+                        report,
+                        n_leaf,
+                        n_nonleaf,
+                    )?;
+                } else if report.len() < RTREE_CHECK_MAX_ERRORS {
+                    report.push(format!("Node {child_no} missing from database"));
+                }
+            }
+
+            if report.len() >= RTREE_CHECK_MAX_ERRORS {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
 }
+
+/// SQLite caps `rtreecheck` at 100 entries (`RTREE_CHECK_MAX_ERROR`).
+const RTREE_CHECK_MAX_ERRORS: usize = 100;
 
 #[derive(Debug, Clone)]
 struct RtreeNode {
@@ -1736,9 +1941,9 @@ impl VTable for RtreeTable {
                 if h == 0 {
                     let aux = match self.read_rowid_aux_values(&conn, c.rowid) {
                         Ok(a) => a,
-                        Err(ResultCode::NotFound) => (0..self.aux_columns.len())
-                            .map(|_| Value::null())
-                            .collect(),
+                        Err(ResultCode::NotFound) => {
+                            (0..self.aux_columns.len()).map(|_| Value::null()).collect()
+                        }
                         Err(e) => return Err(e),
                     };
                     self.insert_leaf_row(&conn, c.rowid, &c, &aux)?;
@@ -2547,6 +2752,71 @@ mod tests {
 
         let remaining_cell = node.get_cell(n_dim2, n_bytes_per_cell, 0);
         assert_eq!(remaining_cell.rowid, 2);
+    }
+
+    #[test]
+    fn test_check_cell_geometry_flags_inverted_coords() {
+        let table = new_table(vec![
+            "rtree", "main", "test", "id", "xmin", "xmax", "ymin", "ymax",
+        ]);
+        let mut bad = RtreeCell::new(7);
+        bad.coords[0] = 10.0;
+        bad.coords[1] = 0.0; // xmin > xmax — corrupt
+        bad.coords[2] = 0.0;
+        bad.coords[3] = 1.0;
+
+        let mut report = Vec::new();
+        table.check_cell_geometry(42, 3, &bad, None, &mut report);
+        assert_eq!(report.len(), 1, "{report:?}");
+        assert!(
+            report[0].contains("Dimension 0 of cell 3 on node 42 is corrupt"),
+            "{}",
+            report[0]
+        );
+    }
+
+    #[test]
+    fn test_check_cell_geometry_flags_out_of_parent() {
+        let table = new_table(vec![
+            "rtree", "main", "test", "id", "xmin", "xmax", "ymin", "ymax",
+        ]);
+        let mut parent = RtreeCell::new(99);
+        parent.coords[0] = 0.0;
+        parent.coords[1] = 10.0;
+        parent.coords[2] = 0.0;
+        parent.coords[3] = 10.0;
+
+        let mut child = RtreeCell::new(1);
+        child.coords[0] = -1.0; // outside parent on left
+        child.coords[1] = 5.0;
+        child.coords[2] = 0.0;
+        child.coords[3] = 11.0; // outside parent on top
+        let mut report = Vec::new();
+        table.check_cell_geometry(7, 0, &child, Some(&parent), &mut report);
+        assert_eq!(report.len(), 2, "{report:?}");
+        assert!(report.iter().any(|s| s.contains("Dimension 0")));
+        assert!(report.iter().any(|s| s.contains("Dimension 1")));
+    }
+
+    #[test]
+    fn test_check_cell_geometry_clean_cell_no_errors() {
+        let table = new_table(vec![
+            "rtree", "main", "test", "id", "xmin", "xmax", "ymin", "ymax",
+        ]);
+        let mut parent = RtreeCell::new(99);
+        parent.coords[0] = 0.0;
+        parent.coords[1] = 10.0;
+        parent.coords[2] = 0.0;
+        parent.coords[3] = 10.0;
+
+        let mut child = RtreeCell::new(1);
+        child.coords[0] = 1.0;
+        child.coords[1] = 9.0;
+        child.coords[2] = 1.0;
+        child.coords[3] = 9.0;
+        let mut report = Vec::new();
+        table.check_cell_geometry(7, 0, &child, Some(&parent), &mut report);
+        assert!(report.is_empty(), "{report:?}");
     }
 
     #[test]
