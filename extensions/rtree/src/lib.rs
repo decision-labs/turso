@@ -1,7 +1,6 @@
 //! R-Tree virtual table extension.
 //!
-//! A Rust implementation of SQLite's rtree extension for spatial indexing.
-//! Uses the R*-tree split heuristic from Beckmann et al. 1990 (see [`split_node`]).
+//! Spatial indexing using the R*-tree split heuristic from Beckmann et al. 1990 (see [`split_node`]).
 //!
 //! ## Usage:
 //!
@@ -11,30 +10,30 @@
 //! SELECT * FROM my_rtree WHERE xmin > 5.0 AND xmax < 15.0;
 //! ```
 //!
-//! Shadow tables follow SQLite's `ext/rtree/rtree.c`: `%_node`, `%_rowid`, `%_parent`.
+//! Shadow tables `%_node`, `%_rowid`, `%_parent` use the on-disk layout from `ext/rtree/rtree.c`.
 //! Auxiliary columns (`+label` / `+label TEXT` in the column list) extend `%_rowid` after `nodeno`.
 //!
-//! ## SQLite parity (intentional gaps)
+//! ## Gaps
 //!
 //! - `MATCH` / `sqlite3_rtree_geometry_callback`-style geometry callbacks are not implemented.
 //! - `RTREE_COORD_INT32` (32-bit integer coordinates) is not implemented.
 //! - Row-count estimates from `sqlite_stat1` in `best_index` are not wired (static `best_index` has no table handle).
-//! - Internal full nodes use the same **promote-to-internal** split as leaf insert (two new siblings under the split
-//!   nodeno). SQLite's alternate `SplitNode` path (`pLeft = pNode`, then `rtreeInsertCell` into the parent for the
+//! - Internal full nodes use the same **promote-to-internal** split as leaf insert (two new siblings under the
+//!   split nodeno). The alternate `SplitNode` path (`pLeft = pNode`, then `rtreeInsertCell` into the parent for the
 //!   right bbox, which may overflow the parent) is not implemented.
-//! - Root collapse (`rtreeDeleteRowid` ~2978) queues cells at height `iDepth-1`; `descend_from_root_with_start` matches
-//!   SQLite `ChooseLeaf` descent counts (`iDepth - iHeight`).
+//! - Root collapse (`rtreeDeleteRowid` ~2978 in `ext/rtree/rtree.c`) queues cells at height `iDepth-1`;
+//!   `descend_from_root_with_start` uses `ChooseLeaf` descent counts (`iDepth - iHeight`).
 //!
 //! ## Split algorithm
 //!
-//! [`split_node`] mirrors SQLite's `splitNodeStartree` (Beckmann et al. 1990): for each dimension, sort cells by
-//! `(min, max)`, scan candidate split points `[MINCELLS..=N-MINCELLS]`, pick the axis with minimum total margin, and
-//! within that axis pick the distribution with minimum overlap (tiebreak: total area). For tiny inputs
-//! (`N < 2 * MINCELLS`) — only reachable from unit tests today — we fall back to a halving split.
+//! [`split_node`] is the R*-tree split (Beckmann et al. 1990; `splitNodeStartree` in `ext/rtree/rtree.c`): for each
+//! dimension, sort cells by `(min, max)`, scan candidate split points `[MINCELLS..=N-MINCELLS]`, pick the axis with
+//! minimum total margin, and within that axis pick the distribution with minimum overlap (tiebreak: total area).
+//! For tiny inputs (`N < 2 * MINCELLS`) — only reachable from unit tests today — we fall back to a halving split.
 //!
 //! ## Integrity check
 //!
-//! [`RtreeTable::integrity_check`] ports SQLite's `rtreecheck` (`ext/rtree/rtree.c` ~3831): per-cell `min ≤ max`,
+//! [`RtreeTable::integrity_check`] (matching `rtreecheck` in `ext/rtree/rtree.c` ~3831): per-cell `min ≤ max`,
 //! containment within parent MBR, `%_rowid` / `%_parent` mapping correctness, and shadow-table count parity. It is
 //! **not yet wired to SQL** — turso_ext scalar functions don't receive a `Connection`, so a SQL-callable
 //! `rtreecheck()` cannot be registered today; the pure-geometry slice is unit-tested via [`RtreeTable::check_cell_geometry`].
@@ -51,10 +50,10 @@ register_extension! {
 }
 
 const RTREE_MAX_DIMENSIONS: usize = 5;
-/// Matches `RTREE_MAX_AUX_COLUMN` in SQLite `ext/rtree/rtree.c`.
+/// See `RTREE_MAX_AUX_COLUMN` in `ext/rtree/rtree.c`.
 const RTREE_MAX_AUX_COLUMN: usize = 100;
 const RTREE_DEFAULT_ROWEST: i64 = 1048576;
-/// Matches `RTREE_MIN_ROWEST` in SQLite `ext/rtree/rtree.c` (floor when estimating rows).
+/// Floor when estimating rows in `best_index`; see `RTREE_MIN_ROWEST` in `ext/rtree/rtree.c`.
 const RTREE_MIN_ROWEST: u32 = 100;
 
 const RTREE_EQ: u8 = b'A';
@@ -104,10 +103,11 @@ fn constraint_op_to_rtree_op(op: ConstraintOp) -> Option<u8> {
 struct RtreeModule;
 
 impl RtreeModule {
-    /// Coordinate columns first, then optional `+name` / `+name TYPE` auxiliary columns
-    /// (stored on `%_rowid`, see SQLite `ext/rtree/rtree.c`).
-    fn parse_column_args(args: &[Value]) -> Result<(usize, Vec<String>), ResultCode> {
-        let mut n_dim2 = 0;
+    /// Coordinate columns first, then optional `+name` / `+name TYPE` auxiliary columns (stored on `%_rowid`; see
+    /// `ext/rtree/rtree.c`). Returns `(coord_names, aux_names)`; `coord_names.len()` is the dimension pair count
+    /// (`nDim2` in the original).
+    fn parse_column_args(args: &[Value]) -> Result<(Vec<String>, Vec<String>), ResultCode> {
+        let mut coord_names = Vec::new();
         let mut aux_names = Vec::new();
         let mut seen_aux = false;
         for arg in args {
@@ -124,18 +124,27 @@ impl RtreeModule {
                     .ok_or(ResultCode::InvalidArgs)?;
                 aux_names.push(name.to_string());
             } else if !seen_aux {
-                n_dim2 += 1;
+                // User can write `xmin` or `xmin REAL` — keep the first whitespace-separated token as the column name.
+                let name = text
+                    .split_whitespace()
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or(ResultCode::InvalidArgs)?;
+                coord_names.push(name.to_string());
             } else {
                 break;
             }
         }
-        if n_dim2 < 2 || n_dim2 > RTREE_MAX_DIMENSIONS * 2 || n_dim2 % 2 != 0 {
+        if coord_names.len() < 2
+            || coord_names.len() > RTREE_MAX_DIMENSIONS * 2
+            || coord_names.len() % 2 != 0
+        {
             return Err(ResultCode::InvalidArgs);
         }
         if aux_names.len() > RTREE_MAX_AUX_COLUMN {
             return Err(ResultCode::InvalidArgs);
         }
-        Ok((n_dim2, aux_names))
+        Ok((coord_names, aux_names))
     }
 }
 
@@ -146,24 +155,32 @@ impl VTabModule for RtreeModule {
     const READONLY: bool = false;
 
     fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        // args[0..3] is [module, db, table]; args[3] is the rowid column name; args[4..] is coord cols + aux cols.
         if args.len() < 5 {
             return Err(ResultCode::InvalidArgs);
         }
 
-        let (n_dim2, aux_columns) = Self::parse_column_args(&args[4..])?;
-        let n_dim = n_dim2 / 2;
+        let rowid_col_name = args[3]
+            .to_text()
+            .map(|s| s.to_string())
+            .ok_or(ResultCode::InvalidArgs)?;
+        let rowid_col_name = rowid_col_name
+            .split_whitespace()
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or(ResultCode::InvalidArgs)?
+            .to_string();
 
+        let (coord_names, aux_columns) = Self::parse_column_args(&args[4..])?;
+        let n_dim2 = coord_names.len();
         let n_bytes_per_cell: usize = 8 + n_dim2 * 4;
         let default_node_size: usize = 4096 - 64;
 
-        let mut columns = String::from("id INTEGER PRIMARY KEY");
-        for i in 0..n_dim {
-            columns.push_str(", x");
-            columns.push_str(&i.to_string());
-            columns.push_str("min REAL");
-            columns.push_str(", x");
-            columns.push_str(&i.to_string());
-            columns.push_str("max REAL");
+        let mut columns = format!("{} INTEGER PRIMARY KEY", quote_sql_ident(&rowid_col_name));
+        for name in &coord_names {
+            columns.push_str(", ");
+            columns.push_str(&quote_sql_ident(name));
+            columns.push_str(" REAL");
         }
         for name in &aux_columns {
             columns.push_str(&format!(", {} TEXT", quote_sql_ident(name)));
@@ -209,7 +226,7 @@ impl RtreeTable {
         (self.node_size - 4) / self.n_bytes_per_cell
     }
 
-    /// Matches `RTREE_MINCELLS` in SQLite `ext/rtree/rtree.c`.
+    /// See `RTREE_MINCELLS` in `ext/rtree/rtree.c`.
     fn min_cells(&self) -> usize {
         self.max_cells() / 3
     }
@@ -685,8 +702,9 @@ impl RtreeTable {
         Ok(())
     }
 
-    /// After removing a cell, enforce SQLite-style minimum fill (`RTREE_MINCELLS`): detach underfull **leaf or internal**
-    /// nodes, then queue their cells for reinsert at `height` (`removeNode` / `reinsertNodeContent` in `rtree.c`).
+    /// After removing a cell, enforce the minimum-fill invariant (`RTREE_MINCELLS`): detach underfull **leaf or
+    /// internal** nodes, then queue their cells for reinsert at `height`. See `removeNode` /
+    /// `reinsertNodeContent` in `ext/rtree/rtree.c`.
     fn fix_after_cell_removal(
         &mut self,
         conn: &Arc<Connection>,
@@ -761,7 +779,7 @@ impl RtreeTable {
             return Ok(());
         };
         let r = root.tree_depth();
-        // Align with SQLite `iDepth > 0 && NCELL(pRoot)==1`: estimate SQLite depth as r - 1 (see ChooseLeaf descent).
+        // The condition is `iDepth > 0 && NCELL(pRoot) == 1`. `iDepth` is `r - 1` (see ChooseLeaf descent).
         let sqlite_depth = r.saturating_sub(1);
         if sqlite_depth == 0 || root.cell_count() != 1 {
             return Ok(());
@@ -967,7 +985,7 @@ impl RtreeTable {
         Ok(0)
     }
 
-    /// Mirror of SQLite `rtreecheck` (`ext/rtree/rtree.c` ~3831). Returns one message per problem found, capped at
+    /// Integrity walker for the r-tree (`rtreecheck` in `ext/rtree/rtree.c` ~3831). Returns one message per problem found, capped at
     /// [`RTREE_CHECK_MAX_ERRORS`]; an empty `Vec` means the tree is internally consistent. Verifies:
     ///   1. every cell has `min ≤ max` per dim
     ///   2. every non-root cell is bounded by its parent's MBR
@@ -1290,6 +1308,9 @@ struct RtreeCursor {
     rowid: i64,
     current_coords: [f32; RTREE_MAX_DIMENSIONS * 2],
     constraints: Vec<RtreeConstraint>,
+    /// Set when `filter` matched a unique-row plan (rowid lookup). `next` then returns EOF without scanning further so
+    /// the engine stops after the single row — matches `idxNum==1` early-exit in `rtreeFilter` (`ext/rtree/rtree.c`).
+    single_row: bool,
     conn: Option<Arc<Connection>>,
     n_dim2: usize,
     n_bytes_per_cell: usize,
@@ -1313,6 +1334,7 @@ impl RtreeCursor {
             rowid: 0,
             current_coords: [0.0; RTREE_MAX_DIMENSIONS * 2],
             constraints: Vec::new(),
+            single_row: false,
             conn,
             n_dim2,
             n_bytes_per_cell,
@@ -1998,7 +2020,8 @@ impl VTable for RtreeTable {
                         idx_num = IDX_NUM_QUERY;
                     }
                     let op_char = rtree_op as char;
-                    let coord_char = ((constraint.column_index - 1) % 10) as u8 as char;
+                    // 0-based coord index ('0'..'9'): column 1 → '0', column 2 → '1', etc.
+                    let coord_char = (b'0' + ((constraint.column_index - 1) % 10) as u8) as char;
                     let pair = format!("{}{}", op_char, coord_char);
                     if let Some(ref mut s) = idx_str {
                         s.push_str(&pair);
@@ -2043,10 +2066,12 @@ impl VTabCursor for RtreeCursor {
         self.constraints.clear();
         self.aux_values.clear();
         self.rowid = 0;
+        self.single_row = false;
 
         let idx_str = idx_info.map(|(s, _)| s).unwrap_or("query");
 
         if idx_str == "rowid_lookup" && !args.is_empty() {
+            self.single_row = true;
             if let Some(id_val) = args.first() {
                 if let Some(id) = id_val.to_integer() {
                     if let Some(conn) = &self.conn {
@@ -2102,7 +2127,8 @@ impl VTabCursor for RtreeCursor {
             }
             let op = idx_bytes[pair_idx];
             let coord_digit = idx_bytes[pair_idx + 1];
-            let coord_idx = ((coord_digit as usize) - (b'0' as usize)) * 2;
+            // 0-based coord index encoded as ASCII digit ('0'..'9').
+            let coord_idx = (coord_digit as usize) - (b'0' as usize);
 
             if arg_idx < args.len() {
                 if let Some(f) = args[arg_idx].to_float() {
@@ -2116,11 +2142,8 @@ impl VTabCursor for RtreeCursor {
             arg_idx += 1;
         }
 
-        if self.constraints.is_empty() {
-            self.at_eof = false;
-            return ResultCode::OK;
-        }
-
+        // Unconstrained scan reuses the same walk: with `constraints` empty, the per-constraint loop is a no-op so
+        // every cell passes the leaf check.
         if let Some(_conn) = &self.conn {
             if let Some(root) = self.load_node(1) {
                 let depth = root.tree_depth();
@@ -2231,7 +2254,7 @@ impl VTabCursor for RtreeCursor {
     }
 
     fn next(&mut self) -> ResultCode {
-        if self.constraints.is_empty() || self.rowid == 0 {
+        if self.single_row || self.rowid == 0 {
             self.at_eof = true;
             return ResultCode::EOF;
         }
@@ -2566,7 +2589,7 @@ mod tests {
     }
 
     /// Two well-separated clusters on the X axis — the R*-tree heuristic must group them on that axis with zero
-    /// overlap, regardless of the order cells were appended. Verifies parity with SQLite `splitNodeStartree`.
+    /// overlap, regardless of the order cells were appended.
     #[test]
     fn test_split_node_groups_clusters_zero_overlap() {
         let table = new_table(vec![
