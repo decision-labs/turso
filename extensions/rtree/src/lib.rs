@@ -1896,42 +1896,56 @@ impl VTable for RtreeTable {
             return Err(ResultCode::InvalidArgs);
         };
         let merged = self.merge_xupdate_argv_with_existing_row(&conn, old_rowid, args)?;
+        let new_rowid = merged.first().and_then(|v| v.to_integer());
         self.delete(Some(conn.clone()), old_rowid)?;
-        self.insert(Some(conn), &merged)?;
+        self.insert(Some(conn), new_rowid, &merged)?;
         Ok(())
     }
 
     fn insert(
         &mut self,
         conn: Option<Arc<Connection>>,
+        rowid: Option<i64>,
         args: &[Value],
     ) -> Result<i64, Self::Error> {
         let Some(conn) = conn else {
             return Err(ResultCode::InvalidArgs);
         };
-        // xUpdate passes argv[2..] as `columns`: id + coordinate pairs + optional aux (see vtab_derive).
+        // `args` is the column slice (xUpdate argv[2..]): rowid-alias slot, coord pairs, then optional aux.
         let required = self.n_dim2 + 1 + self.aux_columns.len();
         if args.len() < required {
             return Err(ResultCode::InvalidArgs);
         }
-        let rowid = match args.first().and_then(|v| v.to_integer()) {
-            Some(id) => {
-                self.row_count = self.row_count.max(id);
-                id
-            }
-            None => {
-                self.row_count += 1;
-                self.row_count
-            }
-        };
 
+        // Resolve the rowid. Core carries it in `rowid` (argv[1]); SQLite reads the same value from the first
+        // column (`aData[2]`). Fall back to the column slot, then to an internal counter for auto-assignment.
+        let rowid = rowid
+            .or_else(|| args.first().and_then(|v| v.to_integer()))
+            .unwrap_or_else(|| self.row_count + 1);
+
+        // Build the cell and enforce coord1 <= coord2 per dimension (`rtreeConstraintError` in rtree.c).
         let mut cell = RtreeCell::new(rowid);
         for i in 0..self.n_dim2 {
             if let Some(val) = args[i + 1].to_float() {
                 cell.coords[i] = val as f32;
             }
         }
+        for d in 0..(self.n_dim2 / 2) {
+            if cell.coords[2 * d] > cell.coords[2 * d + 1] {
+                return Err(ResultCode::ConstraintViolation);
+            }
+        }
 
+        // Reject a duplicate rowid (SQLite returns SQLITE_CONSTRAINT unless the conflict mode is REPLACE). Only
+        // meaningful once the shadow tables exist; the update path deletes the old row before re-inserting, so this
+        // fires only for genuine duplicates.
+        if self.node_count > 0 && self.get_rowid_nodeno(&conn, rowid)?.is_some() {
+            return Err(ResultCode::ConstraintViolation);
+        }
+
+        // Only advance the auto-assign high-water mark once the row is known good, so failed inserts don't perturb
+        // the next NULL-rowid assignment.
+        self.row_count = self.row_count.max(rowid);
         let aux = &args[self.n_dim2 + 1..required];
         self.insert_leaf_row(&conn, rowid, &cell, aux)?;
 

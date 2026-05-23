@@ -255,6 +255,7 @@ impl VTable for KVStoreTable {
     fn insert(
         &mut self,
         _conn: Option<Arc<Connection>>,
+        _rowid: Option<i64>,
         values: &[Value],
     ) -> Result<i64, Self::Error> {
         let comment = values
@@ -293,7 +294,7 @@ impl VTable for KVStoreTable {
         {
             self.store.borrow_mut().remove(&rowid);
         }
-        let _ = self.insert(conn, values)?;
+        let _ = self.insert(conn, Some(rowid), values)?;
         Ok(())
     }
 

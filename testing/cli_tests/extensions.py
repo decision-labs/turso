@@ -1040,6 +1040,146 @@ def test_rtree_aux():
     turso.quit()
 
 
+def _ordered_ids(res: str) -> list[str]:
+    """Parse single-column id output from the REPL into a list of strings."""
+    out = []
+    for raw in res.split("\n"):
+        line = raw.strip()
+        if line and "|" not in line:
+            out.append(line)
+    return out
+
+
+def test_rtree_shadow_tables():
+    """Ported from sqlite ext/rtree/rtree1.test (rtree-1): the %_node / %_rowid / %_parent shadow tables
+    back an rtree once it holds data."""
+    turso = TestTursoShell(init_commands="")
+    test_module_list(turso, "./target/debug/liblimbo_rtree", "rtree")
+
+    turso.run_test_fn(
+        "CREATE VIRTUAL TABLE t1 USING rtree(ii, x1, x2, y1, y2);",
+        null,
+        "create rtree table",
+    )
+    turso.run_test_fn(
+        "INSERT INTO t1 VALUES(1, 1, 3, 2, 4);",
+        null,
+        "insert one row (materializes shadow tables)",
+    )
+    turso.run_test_fn(
+        "SELECT name FROM sqlite_schema WHERE name LIKE 't1%' ORDER BY name;",
+        lambda res: _ordered_ids(res) == ["t1", "t1_node", "t1_parent", "t1_rowid"],
+        "shadow tables t1_node/t1_parent/t1_rowid exist",
+    )
+    turso.run_test_fn("DROP TABLE t1;", null, "drop rtree table")
+    turso.quit()
+
+
+def test_rtree_constraints():
+    """Ported from rtree1.test (rtree-2): NULL rowid auto-assignment, explicit rowid preservation,
+    duplicate-rowid rejection, and the x1<=x2 coordinate constraint."""
+    turso = TestTursoShell(init_commands="")
+    test_module_list(turso, "./target/debug/liblimbo_rtree", "rtree")
+
+    turso.run_test_fn(
+        "CREATE VIRTUAL TABLE t1 USING rtree(ii, x1, x2, y1, y2);",
+        null,
+        "create rtree table",
+    )
+    # NULL rowid auto-assigns sequential ids (rtree-2.1.x).
+    turso.run_test_fn("INSERT INTO t1 VALUES(NULL, 1, 3, 2, 4);", null, "auto-rowid insert 1")
+    turso.run_test_fn("INSERT INTO t1 VALUES(NULL, 1, 3, 2, 4);", null, "auto-rowid insert 2")
+    turso.run_test_fn(
+        "SELECT ii FROM t1 ORDER BY ii;",
+        lambda res: _ordered_ids(res) == ["1", "2"],
+        "auto-assigned rowids are 1,2",
+    )
+    # Explicit rowid is preserved (not silently renumbered).
+    turso.run_test_fn("INSERT INTO t1 VALUES(10, 1, 3, 2, 4);", null, "explicit rowid insert")
+    turso.run_test_fn(
+        "SELECT ii FROM t1 ORDER BY ii;",
+        lambda res: _ordered_ids(res) == ["1", "2", "10"],
+        "explicit rowid 10 preserved",
+    )
+    # Duplicate rowid is rejected (rtree-2.2.1); row count unchanged.
+    turso.run_test_fn(
+        "INSERT INTO t1 VALUES(10, 5, 6, 5, 6);",
+        lambda res: "rror" in res or "onstraint" in res,
+        "duplicate rowid rejected",
+    )
+    turso.run_test_fn(
+        "SELECT count(*) FROM t1;",
+        lambda res: _cli_last_nonempty_line(res) == "3",
+        "duplicate insert did not add a row",
+    )
+    # Coordinate constraint x1<=x2 / y1<=y2 (rtree-2.2.2/2.2.3).
+    turso.run_test_fn(
+        "INSERT INTO t1 VALUES(20, 3, 1, 2, 4);",
+        lambda res: "rror" in res or "onstraint" in res,
+        "x1>x2 rejected",
+    )
+    turso.run_test_fn(
+        "INSERT INTO t1 VALUES(21, 1, 3, 4, 2);",
+        lambda res: "rror" in res or "onstraint" in res,
+        "y1>y2 rejected",
+    )
+    turso.run_test_fn(
+        "SELECT count(*) FROM t1;",
+        lambda res: _cli_last_nonempty_line(res) == "3",
+        "constraint failures added no rows",
+    )
+    # A degenerate but valid cell (min==max) is accepted (rtree-3.2.2).
+    turso.run_test_fn("INSERT INTO t1 VALUES(22, 2, 6, 3, 3);", null, "min==max accepted")
+    turso.run_test_fn("DROP TABLE t1;", null, "drop rtree table")
+    turso.quit()
+
+
+def test_rtree_delete_sequence():
+    """Ported from rtree1.test (rtree-5): deleting rows one by one from a 1-dimension rtree empties the
+    table and its %_rowid shadow."""
+    turso = TestTursoShell(init_commands="")
+    test_module_list(turso, "./target/debug/liblimbo_rtree", "rtree")
+
+    turso.run_test_fn(
+        "CREATE VIRTUAL TABLE t2 USING rtree(ii, x1, x2);",
+        null,
+        "create 1-d rtree",
+    )
+    turso.run_test_fn("INSERT INTO t2 VALUES(1, 10, 20);", null, "insert 1")
+    turso.run_test_fn("INSERT INTO t2 VALUES(2, 30, 40);", null, "insert 2")
+    turso.run_test_fn("INSERT INTO t2 VALUES(3, 50, 60);", null, "insert 3")
+    turso.run_test_fn(
+        "SELECT ii FROM t2 ORDER BY ii;",
+        lambda res: _ordered_ids(res) == ["1", "2", "3"],
+        "three rows present",
+    )
+    turso.run_test_fn("DELETE FROM t2 WHERE ii=2;", null, "delete middle")
+    turso.run_test_fn(
+        "SELECT ii FROM t2 ORDER BY ii;",
+        lambda res: _ordered_ids(res) == ["1", "3"],
+        "middle row gone",
+    )
+    turso.run_test_fn("DELETE FROM t2 WHERE ii=1;", null, "delete first")
+    turso.run_test_fn(
+        "SELECT ii FROM t2 ORDER BY ii;",
+        lambda res: _ordered_ids(res) == ["3"],
+        "only last row remains",
+    )
+    turso.run_test_fn("DELETE FROM t2 WHERE ii=3;", null, "delete last")
+    turso.run_test_fn(
+        "SELECT count(*) FROM t2;",
+        lambda res: _cli_last_nonempty_line(res) == "0",
+        "table empty after deletes",
+    )
+    turso.run_test_fn(
+        "SELECT count(*) FROM t2_rowid;",
+        lambda res: _cli_last_nonempty_line(res) == "0",
+        "%_rowid shadow empty after deletes",
+    )
+    turso.run_test_fn("DROP TABLE t2;", null, "drop rtree table")
+    turso.quit()
+
+
 def test_csv():
     # open new empty connection explicitly to test whether we can load an extension
     # with brand new connection/uninitialized database.
@@ -1244,6 +1384,9 @@ def main():
         test_fuzzy()
         test_rtree()
         test_rtree_aux()
+        test_rtree_shadow_tables()
+        test_rtree_constraints()
+        test_rtree_delete_sequence()
     except Exception as e:
         console.error(f"Test FAILED: {e}")
         cleanup()

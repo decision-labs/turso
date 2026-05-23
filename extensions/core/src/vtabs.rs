@@ -179,9 +179,15 @@ pub trait VTable {
     fn rename(&mut self, _new_name: &str) -> Result<(), Self::Error> {
         Ok(())
     }
+    /// Insert a row. `rowid` is the rowid core resolved for this row (the value from xUpdate `argv[1]`): the
+    /// user-supplied INTEGER PRIMARY KEY, or the value core auto-assigned when none was given. It is `None` only
+    /// when core could not resolve one. `args` is the column slice (`argv[2..]`); for a rowid-alias table the first
+    /// column slot mirrors the rowid (often NULL, since the value is carried in `rowid`). Return the rowid actually
+    /// stored.
     fn insert(
         &mut self,
         _conn: Option<Arc<Connection>>,
+        _rowid: Option<i64>,
         _args: &[Value],
     ) -> Result<i64, Self::Error> {
         Ok(0)

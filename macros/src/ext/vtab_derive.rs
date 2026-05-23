@@ -181,9 +181,11 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                         }
                         return ::turso_ext::ResultCode::OK;
                     }
-                    // INSERT: no old_rowid (old_rowid = None)
+                    // INSERT: no old_rowid (old_rowid = None). `new_rowid` carries the rowid core resolved
+                    // (explicit INTEGER PRIMARY KEY or auto-assigned); pass it through so rowid-alias tables can
+                    // honor it instead of re-deriving from the NULLed first column slot.
                     (None, _) => {
-                        if let Ok(rowid) = <#struct_name as VTabModule>::Table::insert(table, rust_conn, &columns) {
+                        if let Ok(rowid) = <#struct_name as VTabModule>::Table::insert(table, rust_conn, new_rowid, &columns) {
                             if !p_out_rowid.is_null() {
                                 *p_out_rowid = rowid;
                                  return ::turso_ext::ResultCode::RowID;
