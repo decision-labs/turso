@@ -252,10 +252,10 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn destroy(&self) -> crate::Result<()> {
+    pub(crate) fn destroy(&self, conn: Arc<Connection>) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Ok(()),
-            VirtualTableType::External(table) => table.destroy(),
+            VirtualTableType::External(table) => table.destroy(conn),
             VirtualTableType::Internal(_) => Ok(()),
         }
     }
@@ -545,10 +545,31 @@ impl ExtVirtualTable {
         }
     }
 
-    fn destroy(&self) -> crate::Result<()> {
+    fn destroy(&self, conn: Arc<Connection>) -> crate::Result<()> {
+        // Hand the extension a live connection (as xUpdate does) so it can drop its backing/shadow tables.
+        let weak = Arc::downgrade(&conn);
+        let weak_box = Box::into_raw(Box::new(weak));
+        let ext_conn = turso_ext::Conn::new(
+            weak_box as *mut c_void,
+            crate::ext::prepare_stmt,
+            crate::ext::execute,
+        );
+        let ext_conn_ptr = Box::into_raw(Box::new(ext_conn));
+
         let rc = unsafe {
-            (self.implementation.destroy)(self.table_ptr.load(Ordering::SeqCst) as *const c_void)
+            (self.implementation.destroy)(
+                self.table_ptr.load(Ordering::SeqCst) as *const c_void,
+                ext_conn_ptr as *const turso_ext::Conn,
+            )
         };
+
+        unsafe {
+            let conn_box = Box::from_raw(ext_conn_ptr);
+            if !conn_box._ctx.is_null() {
+                let _ = Box::from_raw(conn_box._ctx as *mut Weak<Connection>);
+            }
+        }
+
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(LimboError::ExtensionError(rc.to_string())),

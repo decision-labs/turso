@@ -69,8 +69,9 @@ impl VTabModuleImpl {
     //       is executed, using the `shell_add_schema` UDF function.
     pub fn create_schema(&self, args: Vec<Value>) -> crate::ExtResult<String> {
         self.create(args).and_then(|(schema, table)| {
-            // Drop the allocated table instance to avoid a memory leak.
-            let result = unsafe { (self.destroy)(table) };
+            // Drop the allocated table instance to avoid a memory leak. Null conn: this is a transient free, not a
+            // DROP TABLE, so the extension must not touch persistent storage.
+            let result = unsafe { (self.destroy)(table, std::ptr::null()) };
             if result.is_ok() {
                 Ok(schema)
             } else {
@@ -111,7 +112,8 @@ pub type VtabFnUpdate = unsafe extern "C" fn(
     p_out_rowid: *mut i64,
 ) -> ResultCode;
 
-pub type VtabFnDestroy = unsafe extern "C" fn(table: *const c_void) -> ResultCode;
+pub type VtabFnDestroy =
+    unsafe extern "C" fn(table: *const c_void, conn: *const Conn) -> ResultCode;
 
 pub type VtabBegin = unsafe extern "C" fn(table: *mut c_void) -> ResultCode;
 pub type VtabCommit = unsafe extern "C" fn(table: *mut c_void) -> ResultCode;
@@ -195,7 +197,10 @@ pub trait VTable {
     fn delete(&mut self, _conn: Option<Arc<Connection>>, _rowid: i64) -> Result<(), Self::Error> {
         Ok(())
     }
-    fn destroy(&mut self) -> Result<(), Self::Error> {
+    /// Drop the virtual table's backing storage. `conn` is `Some` for a real `DROP TABLE` and `None` when the core
+    /// is only freeing a transient table instance (e.g. after extracting the schema), in which case no persistent
+    /// state should be touched.
+    fn destroy(&mut self, _conn: Option<Arc<Connection>>) -> Result<(), Self::Error> {
         Ok(())
     }
 

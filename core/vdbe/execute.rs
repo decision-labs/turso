@@ -1558,7 +1558,7 @@ pub fn op_vdestroy(
                 "Could not find Virtual Table to Destroy".to_string(),
             ));
         };
-        vtab.destroy()?;
+        vtab.destroy(conn.clone())?;
     }
 
     state.pc += 1;

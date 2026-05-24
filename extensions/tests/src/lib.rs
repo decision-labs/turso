@@ -298,7 +298,7 @@ impl VTable for KVStoreTable {
         Ok(())
     }
 
-    fn destroy(&mut self) -> Result<(), Self::Error> {
+    fn destroy(&mut self, _conn: Option<Arc<Connection>>) -> Result<(), Self::Error> {
         log::debug!("VDestroy called");
         Ok(())
     }

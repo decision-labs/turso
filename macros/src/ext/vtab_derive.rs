@@ -209,15 +209,24 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
             #[no_mangle]
             unsafe extern "C" fn #destroy_fn_name(
                 table: *const ::std::ffi::c_void,
+                conn: *const ::turso_ext::Conn,
             ) -> ::turso_ext::ResultCode {
                 if table.is_null() {
                     return ::turso_ext::ResultCode::Error;
                 }
 
+                // `conn` is non-null only for a real DROP TABLE; it is null when the core merely frees a transient
+                // table instance (e.g. after extracting the schema). Extensions use it to drop backing storage.
+                let rust_conn = if conn.is_null() {
+                    None
+                } else {
+                    Some(::std::sync::Arc::new(::turso_ext::Connection::new(conn)))
+                };
+
                 // Take ownership of the table so it can be properly dropped.
                 let mut table: ::std::boxed::Box<<#struct_name as ::turso_ext::VTabModule>::Table> =
                 ::std::boxed::Box::from_raw(table as *mut <#struct_name as ::turso_ext::VTabModule>::Table);
-                if <#struct_name as VTabModule>::Table::destroy(&mut *table).is_err() {
+                if <#struct_name as VTabModule>::Table::destroy(&mut *table, rust_conn).is_err() {
                     return ::turso_ext::ResultCode::Error;
                 }
 

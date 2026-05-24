@@ -1072,6 +1072,12 @@ def test_rtree_shadow_tables():
         "shadow tables t1_node/t1_parent/t1_rowid exist",
     )
     turso.run_test_fn("DROP TABLE t1;", null, "drop rtree table")
+    # DROP TABLE drops the shadow tables too (SQLite xDestroy parity).
+    turso.run_test_fn(
+        "SELECT count(*) FROM sqlite_schema WHERE name LIKE 't1%';",
+        lambda res: _cli_last_nonempty_line(res) == "0",
+        "shadow tables removed on drop",
+    )
     turso.quit()
 
 

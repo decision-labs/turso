@@ -23,9 +23,6 @@
 //!   right bbox, which may overflow the parent) is not implemented.
 //! - Root collapse (`rtreeDeleteRowid` ~2978 in `ext/rtree/rtree.c`) queues cells at height `iDepth-1`;
 //!   `descend_from_root_with_start` uses `ChooseLeaf` descent counts (`iDepth - iHeight`).
-//! - `DROP TABLE` does not yet drop the `%_node` / `%_rowid` / `%_parent` shadow tables (SQLite's `xDestroy`
-//!   does). `VTable::destroy` receives no `Connection`, and the same entry point is reused by `create_schema`
-//!   to free a transient table instance, so a clean fix needs a separate conn-carrying drop path.
 //! - On-conflict clauses (`INSERT OR REPLACE`/`OR IGNORE`) are not honored; a duplicate rowid always errors.
 //!
 //! ## Split algorithm
@@ -1995,7 +1992,20 @@ impl VTable for RtreeTable {
         Ok(())
     }
 
-    fn destroy(&mut self) -> Result<(), Self::Error> {
+    fn destroy(&mut self, conn: Option<Arc<Connection>>) -> Result<(), Self::Error> {
+        // DROP TABLE: drop the shadow tables (SQLite's xDestroy). With no connection (transient instance free) or
+        // before any shadow table was materialized, there is nothing to do.
+        let Some(conn) = conn else {
+            return Ok(());
+        };
+        for tbl in [
+            self.shadow_node_table(),
+            self.shadow_rowid_table(),
+            self.shadow_parent_table(),
+        ] {
+            conn.execute(&format!("DROP TABLE IF EXISTS {tbl}"), &[])
+                .map_err(|_| ResultCode::Error)?;
+        }
         Ok(())
     }
 
