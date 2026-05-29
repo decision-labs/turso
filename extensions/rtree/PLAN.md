@@ -59,12 +59,6 @@ Status legend: ✅ done · 🟡 partial · ⛔ not started · 🚧 blocked
 
 ## Test coverage
 
-- Rust unit tests (`extensions/rtree/src/lib.rs`): split heuristic, MBR math, cell geometry checks,
-  constraint helpers, node/cell serialization (26 tests).
-- Python CLI (`testing/cli_tests/extensions.py`): `test_rtree`, `test_rtree_aux`,
-  `test_rtree_shadow_tables` (shadow tables materialize + dropped on DROP),
-  `test_rtree_constraints` (auto/explicit rowid, duplicate + coord rejection),
-  `test_rtree_delete_sequence` (1-d delete-to-empty incl. `%_rowid`).
-- Ported from `rtree1.test`: rtree-1 (create/shadow/drop), rtree-2 (implicit constraints),
-  rtree-5 (delete). Not yet ported: rtree-3 (scans), rtree-4 (insert), rtree-6 (update),
-  rtree-7 (rename), rtree-8 (constrained scans), rtree-12 (on-conflict), rtree-14 (type coercion).
+- ✅ Rust unit tests: 26 tests passing (split heuristic, MBR math, cell geometry, constraint helpers, node/cell serialization).
+- ✅ Python CLI tests: `test_rtree`, `test_rtree_aux`, `test_rtree_shadow_tables`, `test_rtree_constraints`, `test_rtree_delete_sequence`.
+- ✅ Ported from `rtree1.test`: rtree-1 (create/shadow/drop), rtree-2 (implicit constraints), rtree-5 (delete). Not yet ported: rtree-3 (scans), rtree-4 (insert), rtree-6 (update), rtree-7 (rename), rtree-8 (constrained scans), rtree-12 (on-conflict), rtree-14 (type coercion).
