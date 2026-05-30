@@ -288,6 +288,11 @@ impl Database {
         #[cfg(feature = "percentile")]
         crate::percentile::register_extension(&mut ext_api);
         crate::regexp::register_extension(&mut ext_api);
+        #[cfg(feature = "rtree")]
+        {
+            // SAFETY: limbo_rtree has no global state and is safe to register
+            unsafe { crate::limbo_rtree::register_extension(&mut ext_api) };
+        }
         #[cfg(feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;

@@ -144,6 +144,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 argc: i32,
                 argv: *const ::turso_ext::Value,
                 p_out_rowid: *mut i64,
+                conflict_action: u16,
             ) -> ::turso_ext::ResultCode {
                 if table.is_null() {
                     return ::turso_ext::ResultCode::Error;
@@ -176,7 +177,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                     }
                     // UPDATE: old_rowid provided and new_rowid may exist
                     (Some(old), Some(_new)) => {
-                        if <#struct_name as VTabModule>::Table::update(table, rust_conn, old, &columns).is_err() {
+                        if <#struct_name as VTabModule>::Table::update(table, rust_conn, old, &columns, Some(conflict_action)).is_err() {
                             return ::turso_ext::ResultCode::Error;
                         }
                         return ::turso_ext::ResultCode::OK;
@@ -185,7 +186,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                     // (explicit INTEGER PRIMARY KEY or auto-assigned); pass it through so rowid-alias tables can
                     // honor it instead of re-deriving from the NULLed first column slot.
                     (None, _) => {
-                        if let Ok(rowid) = <#struct_name as VTabModule>::Table::insert(table, rust_conn, new_rowid, &columns) {
+                        if let Ok(rowid) = <#struct_name as VTabModule>::Table::insert(table, rust_conn, new_rowid, &columns, Some(conflict_action)) {
                             if !p_out_rowid.is_null() {
                                 *p_out_rowid = rowid;
                                  return ::turso_ext::ResultCode::RowID;

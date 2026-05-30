@@ -244,10 +244,11 @@ impl VirtualTable {
         &self,
         conn: Arc<Connection>,
         args: &[Value],
+        conflict_action: u16,
     ) -> crate::Result<Option<i64>> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ReadOnly),
-            VirtualTableType::External(table) => table.update(conn, args),
+            VirtualTableType::External(table) => table.update(conn, args, conflict_action),
             VirtualTableType::Internal(_) => Err(LimboError::ReadOnly),
         }
     }
@@ -502,7 +503,12 @@ impl ExtVirtualTable {
         ExtVirtualTableCursor::new(cursor, ext_conn_ptr, self.implementation.clone(), id)
     }
 
-    fn update(&self, conn: Arc<Connection>, args: &[Value]) -> crate::Result<Option<i64>> {
+    fn update(
+        &self,
+        conn: Arc<Connection>,
+        args: &[Value],
+        conflict_action: u16,
+    ) -> crate::Result<Option<i64>> {
         let arg_count = args.len();
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
         let mut newrowid = 0i64;
@@ -523,6 +529,7 @@ impl ExtVirtualTable {
                 arg_count as i32,
                 ext_args.as_ptr(),
                 &mut newrowid as *mut i64,
+                conflict_action,
             )
         };
 

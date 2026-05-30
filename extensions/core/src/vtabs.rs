@@ -110,6 +110,7 @@ pub type VtabFnUpdate = unsafe extern "C" fn(
     argc: i32,
     argv: *const Value,
     p_out_rowid: *mut i64,
+    conflict_action: u16,
 ) -> ResultCode;
 
 pub type VtabFnDestroy =
@@ -175,6 +176,7 @@ pub trait VTable {
         _conn: Option<Arc<Connection>>,
         _rowid: i64,
         _args: &[Value],
+        _conflict_action: Option<u16>,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -191,6 +193,7 @@ pub trait VTable {
         _conn: Option<Arc<Connection>>,
         _rowid: Option<i64>,
         _args: &[Value],
+        _conflict_action: Option<u16>,
     ) -> Result<i64, Self::Error> {
         Ok(0)
     }

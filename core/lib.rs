@@ -4,6 +4,9 @@
 )]
 #![recursion_limit = "256"]
 
+#[cfg(feature = "rtree")]
+extern crate limbo_rtree;
+
 pub mod alloc;
 pub mod busy;
 #[cfg(feature = "cli_only")]

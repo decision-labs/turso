@@ -257,6 +257,7 @@ impl VTable for KVStoreTable {
         _conn: Option<Arc<Connection>>,
         _rowid: Option<i64>,
         values: &[Value],
+        _conflict_action: Option<u16>,
     ) -> Result<i64, Self::Error> {
         let comment = values
             .first()
@@ -290,11 +291,12 @@ impl VTable for KVStoreTable {
         conn: Option<Arc<Connection>>,
         rowid: i64,
         values: &[Value],
+        _conflict_action: Option<u16>,
     ) -> Result<(), Self::Error> {
         {
             self.store.borrow_mut().remove(&rowid);
         }
-        let _ = self.insert(conn, Some(rowid), values)?;
+        let _ = self.insert(conn, Some(rowid), values, _conflict_action)?;
         Ok(())
     }
 

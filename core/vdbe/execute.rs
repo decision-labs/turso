@@ -1488,7 +1488,7 @@ pub fn op_vupdate(
             unreachable!("sqlite_dbpage writes require cli_only feature");
         }
     } else {
-        virtual_table.update(program.connection.clone(), &argv)
+        virtual_table.update(program.connection.clone(), &argv, *conflict_action)
     };
     match result {
         Ok(Some(new_rowid)) => {

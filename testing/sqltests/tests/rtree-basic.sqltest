@@ -1,0 +1,42 @@
+@database :memory:
+
+# Basic rtree insert and point query
+setup rtree {
+    CREATE VIRTUAL TABLE rt1 USING rtree(id, xmin, xmax, ymin, ymax);
+    INSERT INTO rt1 VALUES(1, 0.0, 10.0, 0.0, 10.0);
+    INSERT INTO rt1 VALUES(2, 5.0, 15.0, 5.0, 15.0);
+    INSERT INTO rt1 VALUES(3, 20.0, 30.0, 20.0, 30.0);
+}
+
+@setup rtree
+test count-all {
+    SELECT COUNT(*) FROM rt1;
+}
+expect {
+    3
+}
+
+@setup rtree
+test point-query {
+    SELECT id FROM rt1 WHERE xmin > 5.0 AND xmax < 15.0;
+}
+expect {
+    2
+}
+
+@setup rtree
+test point-query-exact {
+    SELECT id FROM rt1 WHERE xmin >= 0.0 AND xmax <= 10.0 AND ymin >= 0.0 AND ymax <= 10.0;
+}
+expect {
+    1
+}
+
+@setup rtree
+test delete-one {
+    DELETE FROM rt1 WHERE id = 2;
+    SELECT COUNT(*) FROM rt1;
+}
+expect {
+    2
+}
