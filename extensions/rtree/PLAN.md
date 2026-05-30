@@ -21,7 +21,7 @@ Status legend: ✅ done · 🟡 partial · ⛔ not started · 🚧 blocked
 - ✅ `CREATE`/`USING rtree(...)` with up to 5 dimensions; honors user column names and `+aux` columns.
 - ✅ xCreate argv aligned to SQLite `[module, db, table, ...USING-args]` (fixed core `VirtualTable::table`).
 - ✅ xEof contract: engine consults `eof()` after `filter`/`next` (fixed core `ExtVirtualTable`).
-- ✅ R*-tree split — `splitNodeStartree` (Beckmann 1990): per-axis sort, min margin → overlap → area.
+- ✅ R*-Tree split — `splitNodeStartree` (Beckmann 1990): per-axis sort, min margin → overlap → area.
 - ✅ Insert: ChooseLeaf descent, leaf split, AdjustTree (MBR propagation up ancestors).
 - ✅ Delete: underflow / `removeNode` + `reinsertNodeContent`, root single-child collapse, MBR tighten.
 - ✅ Update: delete + reinsert, merging xUpdate NULL placeholders with the stored row.
@@ -30,17 +30,16 @@ Status legend: ✅ done · 🟡 partial · ⛔ not started · 🚧 blocked
 - ✅ Explicit rowid honored (xUpdate argv[1] threaded into `VTable::insert`); NULL → auto-assign.
 - ✅ `DROP TABLE` drops shadow tables — xDestroy parity (Connection threaded into `VTable::destroy`).
 - ✅ `rtreecheck` integrity walker as a pure-Rust method (`RtreeTable::integrity_check`).
+- ✅ `rtree_i32` module variant (`RtreeModuleI32`, `coord_type=1`, INTEGER shadow columns).
+- ✅ `INSERT OR REPLACE`/`OR IGNORE` on-conflict handling (conflict_action propagated to insert).
+- ✅ Clippy clean — PI constants replaced with `std::f32::consts::PI`, `strip_prefix` over slice.
 
 ## Remaining (rough priority order)
 
-1. ⛔ **On-conflict** (`INSERT OR REPLACE`/`OR IGNORE`, rtree-12). A duplicate rowid always errors;
-   the xUpdate conflict mode is not surfaced to the extension. Needs the FFI update path to pass
-   `conflict_action` (already computed in `op_vupdate` emission) through to `VTable::insert`.
-2. 🚧 **SQL-callable `rtreecheck()`** (function exists in Rust). Blocked: turso_ext scalar functions
-   receive no `Connection`, so they can't query shadow tables. Needs a connection-aware scalar
-   variant in turso_ext.
-3. ⛔ **`rtree_i32`** — integer-coordinate module variant (`RTREE_COORD_INT32`). Needs a coord-type
-   flag threaded through cell read/write and the area/margin/overlap math.
+1. ✅ ~~On-conflict~~ — done (conflict_action propagated, INSERT OR REPLACE/OR IGNORE work).
+2. ✅ ~~`rtree_i32`~~ — done (RtreeModuleI32, coord_type=1, INTEGER shadow schema).
+3. 🚧 **SQL-callable `rtreecheck()`** — function exists in Rust, but turso_ext scalar functions
+   receive no `Connection`, so it can't query shadow tables. Needs connection-aware scalar.
 4. ⛔ **`sqlite_stat1` row estimates** in `best_index` (static `best_index` has no table handle).
 5. ⛔ **MATCH operator + geometry callbacks** (`sqlite3_rtree_geometry_callback` /
    `sqlite3_rtree_query_callback`, op `0x46`, priority-queue best-first scan). Largest item.

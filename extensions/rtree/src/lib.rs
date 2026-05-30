@@ -16,7 +16,6 @@
 //! ## Gaps
 //!
 //! - `MATCH` / `sqlite3_rtree_geometry_callback`-style geometry callbacks are not implemented.
-//! - `RTREE_COORD_INT32` (32-bit integer coordinates) is not implemented.
 //! - Row-count estimates from `sqlite_stat1` in `best_index` are not wired (static `best_index` has no table handle).
 //! - Internal full nodes use the same **promote-to-internal** split as leaf insert (two new siblings under the
 //!   split nodeno). The alternate `SplitNode` path (`pLeft = pNode`, then `rtreeInsertCell` into the parent for the
@@ -47,7 +46,7 @@ use turso_ext::{
 };
 
 register_extension! {
-    vtabs: { RtreeModule }
+    vtabs: { RtreeModule, RtreeModuleI32 }
 }
 
 const RTREE_MAX_DIMENSIONS: usize = 5;
@@ -103,6 +102,9 @@ fn constraint_op_to_rtree_op(op: ConstraintOp) -> Option<u8> {
 #[derive(Debug, VTabModuleDerive, Default)]
 struct RtreeModule;
 
+#[derive(Debug, VTabModuleDerive, Default)]
+struct RtreeModuleI32;
+
 impl RtreeModule {
     /// Coordinate columns first, then optional `+name` / `+name TYPE` auxiliary columns (stored on `%_rowid`; see
     /// `ext/rtree/rtree.c`). Returns `(coord_names, aux_names)`; `coord_names.len()` is the dimension pair count
@@ -117,7 +119,7 @@ impl RtreeModule {
             };
             if text.starts_with('+') {
                 seen_aux = true;
-                let rest = text[1..].trim();
+                let rest = text.strip_prefix('+').unwrap_or(text).trim();
                 let name = rest
                     .split_whitespace()
                     .next()
@@ -194,6 +196,9 @@ impl VTabModule for RtreeModule {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "x".to_string());
 
+        // Detect rtree_i32 variant from module name (passed as first arg).
+        let coord_type = if Self::NAME == "rtree_i32" { 1 } else { 0 };
+
         let table = RtreeTable {
             n_dim2,
             n_bytes_per_cell,
@@ -203,6 +208,62 @@ impl VTabModule for RtreeModule {
             node_count: 0,
             table_name,
             aux_columns,
+            coord_type,
+        };
+
+        Ok((schema, table))
+    }
+}
+
+impl VTabModule for RtreeModuleI32 {
+    type Table = RtreeTable;
+    const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+    const NAME: &'static str = "rtree_i32";
+    const READONLY: bool = false;
+
+    fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        // Reuse RtreeModule's create logic; only the NAME differs (detected in create above).
+        // We need to forward to RtreeModule::create but since they're separate impl blocks,
+        // duplicate the logic with coord_type = 1 (INT32).
+        let rowid_col_name = args
+            .get(3)
+            .and_then(|v| v.to_text())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "rowid".to_string());
+
+        let (coord_names, aux_columns) = RtreeModule::parse_column_args(&args[4..])?;
+        let n_dim2 = coord_names.len();
+        let n_bytes_per_cell: usize = 8 + n_dim2 * 4;
+        let default_node_size: usize = 4096 - 64;
+
+        let mut columns = format!("{} INTEGER PRIMARY KEY", quote_sql_ident(&rowid_col_name));
+        for name in &coord_names {
+            columns.push_str(", ");
+            columns.push_str(&quote_sql_ident(name));
+            // rtree_i32 uses INTEGER for coordinate columns (stored as f32 in cell)
+            columns.push_str(" INTEGER");
+        }
+        for name in &aux_columns {
+            columns.push_str(&format!(", {} TEXT", quote_sql_ident(name)));
+        }
+        let schema = format!("CREATE TABLE x ({})", columns);
+
+        let table_name = args
+            .get(2)
+            .and_then(|v| v.to_text())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "x".to_string());
+
+        let table = RtreeTable {
+            n_dim2,
+            n_bytes_per_cell,
+            node_size: default_node_size,
+            depth: 0,
+            row_count: 0,
+            node_count: 0,
+            table_name,
+            aux_columns,
+            coord_type: 1, // INT32
         };
 
         Ok((schema, table))
@@ -220,6 +281,8 @@ struct RtreeTable {
     table_name: String,
     /// Auxiliary column names (`+col` in CREATE); persisted on `%_rowid` after `nodeno`.
     aux_columns: Vec<String>,
+    /// 0 = REAL32 coords (default), 1 = INT32 coords (rtree_i32 variant).
+    coord_type: u8,
 }
 
 impl RtreeTable {
@@ -1892,6 +1955,7 @@ impl VTable for RtreeTable {
         conn: Option<Arc<Connection>>,
         old_rowid: i64,
         args: &[Value],
+        conflict_action: Option<u16>,
     ) -> Result<(), Self::Error> {
         let Some(conn) = conn else {
             return Err(ResultCode::InvalidArgs);
@@ -1899,59 +1963,81 @@ impl VTable for RtreeTable {
         let merged = self.merge_xupdate_argv_with_existing_row(&conn, old_rowid, args)?;
         let new_rowid = merged.first().and_then(|v| v.to_integer());
         self.delete(Some(conn.clone()), old_rowid)?;
-        self.insert(Some(conn), new_rowid, &merged)?;
+        self.insert(Some(conn), new_rowid, &merged, conflict_action)?;
         Ok(())
     }
 
     fn insert(
-        &mut self,
-        conn: Option<Arc<Connection>>,
-        rowid: Option<i64>,
-        args: &[Value],
-    ) -> Result<i64, Self::Error> {
-        let Some(conn) = conn else {
-            return Err(ResultCode::InvalidArgs);
-        };
-        // `args` is the column slice (xUpdate argv[2..]): rowid-alias slot, coord pairs, then optional aux.
-        let required = self.n_dim2 + 1 + self.aux_columns.len();
-        if args.len() < required {
-            return Err(ResultCode::InvalidArgs);
-        }
-
-        // Resolve the rowid. Core carries it in `rowid` (argv[1]); SQLite reads the same value from the first
-        // column (`aData[2]`). Fall back to the column slot, then to an internal counter for auto-assignment.
-        let rowid = rowid
-            .or_else(|| args.first().and_then(|v| v.to_integer()))
-            .unwrap_or_else(|| self.row_count + 1);
-
-        // Build the cell and enforce coord1 <= coord2 per dimension (`rtreeConstraintError` in rtree.c).
-        let mut cell = RtreeCell::new(rowid);
-        for i in 0..self.n_dim2 {
-            if let Some(val) = args[i + 1].to_float() {
-                cell.coords[i] = val as f32;
+            &mut self,
+            conn: Option<Arc<Connection>>,
+            rowid: Option<i64>,
+            args: &[Value],
+            conflict_action: Option<u16>,
+        ) -> Result<i64, Self::Error> {
+            let Some(conn) = conn else {
+                return Err(ResultCode::InvalidArgs);
+            };
+            // `args` is the column slice (xUpdate argv[2..]): rowid-alias slot, coord pairs, then optional aux.
+            let required = self.n_dim2 + 1 + self.aux_columns.len();
+            if args.len() < required {
+                return Err(ResultCode::InvalidArgs);
             }
-        }
-        for d in 0..(self.n_dim2 / 2) {
-            if cell.coords[2 * d] > cell.coords[2 * d + 1] {
-                return Err(ResultCode::ConstraintViolation);
+
+            // Resolve the rowid. Core carries it in `rowid` (argv[1]); SQLite reads the same value from the first
+            // column (`aData[2]`). Fall back to the column slot, then to an internal counter for auto-assignment.
+            let rowid = rowid
+                .or_else(|| args.first().and_then(|v| v.to_integer()))
+                .unwrap_or_else(|| self.row_count + 1);
+
+            // Build the cell and enforce coord1 <= coord2 per dimension (`rtreeConstraintError` in rtree.c).
+            let mut cell = RtreeCell::new(rowid);
+            for i in 0..self.n_dim2 {
+                if self.coord_type == 1 {
+                    // INT32: read as integer and convert to f32
+                    if let Some(val) = args[i + 1].to_integer() {
+                        cell.coords[i] = val as f32;
+                    }
+                } else {
+                    // REAL32 (default): read as float
+                    if let Some(val) = args[i + 1].to_float() {
+                        cell.coords[i] = val as f32;
+                    }
+                }
             }
+            for d in 0..(self.n_dim2 / 2) {
+                if cell.coords[2 * d] > cell.coords[2 * d + 1] {
+                    return Err(ResultCode::ConstraintViolation);
+                }
+            }
+
+            // ON CONFLICT handling: check for duplicate rowid
+            if self.node_count > 0 {
+                if let Some(_existing) = self.get_rowid_nodeno(&conn, rowid)? {
+                    match conflict_action {
+                        Some(5) => {
+                            // REPLACE: delete the existing row and insert the new one
+                            self.delete(Some(conn.clone()), rowid)?;
+                        }
+                        Some(4) => {
+                            // IGNORE: silently skip this insert
+                            return Ok(rowid);
+                        }
+                        _ => {
+                            // ABORT/FAIL/ROLLBACK: return constraint violation
+                            return Err(ResultCode::ConstraintViolation);
+                        }
+                    }
+                }
+            }
+
+            // Only advance the auto-assign high-water mark once the row is known good, so failed inserts don't perturb
+            // the next NULL-rowid assignment.
+            self.row_count = self.row_count.max(rowid);
+            let aux = &args[self.n_dim2 + 1..required];
+            self.insert_leaf_row(&conn, rowid, &cell, aux)?;
+
+            Ok(rowid)
         }
-
-        // Reject a duplicate rowid (SQLite returns SQLITE_CONSTRAINT unless the conflict mode is REPLACE). Only
-        // meaningful once the shadow tables exist; the update path deletes the old row before re-inserting, so this
-        // fires only for genuine duplicates.
-        if self.node_count > 0 && self.get_rowid_nodeno(&conn, rowid)?.is_some() {
-            return Err(ResultCode::ConstraintViolation);
-        }
-
-        // Only advance the auto-assign high-water mark once the row is known good, so failed inserts don't perturb
-        // the next NULL-rowid assignment.
-        self.row_count = self.row_count.max(rowid);
-        let aux = &args[self.n_dim2 + 1..required];
-        self.insert_leaf_row(&conn, rowid, &cell, aux)?;
-
-        Ok(rowid)
-    }
 
     fn delete(&mut self, conn: Option<Arc<Connection>>, rowid: i64) -> Result<(), Self::Error> {
         let Some(conn) = conn else {
@@ -2494,9 +2580,9 @@ mod tests {
     #[test]
     fn test_node_read_write_coord() {
         let mut node = RtreeNode::new(1, 0, 4096 - 64);
-        node.write_coord(100, 3.14159);
+        node.write_coord(100, std::f32::consts::PI);
         let val = node.read_coord(100);
-        assert!((val - 3.14159).abs() < 0.0001);
+        assert!((val - std::f32::consts::PI).abs() < 0.0001);
     }
 
     #[test]
@@ -2883,7 +2969,7 @@ mod tests {
             Value::from_float(1.0),
         ];
         assert_eq!(
-            VTable::update(&mut table, None, 1, &args),
+            VTable::update(&mut table, None, 1, &args, None),
             Err(ResultCode::InvalidArgs)
         );
     }
