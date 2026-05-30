@@ -667,6 +667,7 @@ pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
+    pub connection: Option<Arc<Connection>>,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
@@ -794,6 +795,7 @@ impl ProgramState {
             cursors,
             cursor_seqs,
             registers,
+            connection: None,
             pre_op_registers: None,
             result_row: None,
             last_compare: None,

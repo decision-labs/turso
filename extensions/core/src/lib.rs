@@ -4,11 +4,11 @@ mod types;
 mod vfs_modules;
 mod vtabs;
 pub use functions::{
-    AggCtx, AggFunc, ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunc,
-    ScalarFunction, StepFunction, ValueDestructor,
+    AggCtx, AggFunc, ContextDestructor, FinalizeFunction, GeometryCallbackFn, InitAggFunction,
+    ScalarFunc, ScalarFunction, ScalarFunctionConnCtx, StepFunction, ValueDestructor,
 };
-use functions::{RegisterAggFn, RegisterScalarFn, UnregisterFunctionFn};
-use std::os::raw::c_void;
+use functions::{RegisterAggFn, RegisterScalarFn, RegisterScalarFnWithCtx, UnregisterFunctionFn};
+use std::os::raw::{c_char, c_void};
 #[cfg(feature = "vfs")]
 pub use turso_macros::VfsDerive;
 pub use turso_macros::{
@@ -35,9 +35,20 @@ pub type ExtensionEntryPoint = unsafe extern "C" fn(api: *const ExtensionApi) ->
 pub struct ExtensionApi {
     pub ctx: *mut c_void,
     pub register_scalar_function: RegisterScalarFn,
+    pub register_scalar_function_with_ctx: RegisterScalarFnWithCtx,
     pub register_aggregate_function: RegisterAggFn,
     pub unregister_function: UnregisterFunctionFn,
     pub register_vtab_module: RegisterModuleFn,
+    /// Entry point for `sqlite3_rtree_geometry_callback`. Takes a connection context
+    /// pointer, function name, and an opaque user context pointer. The connection is
+    /// recovered from `CURRENT_CONN_CTX` at invocation time; the user context is
+    /// passed through to the geometry callback.
+    pub rtree_geometry_callback: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        name: *const c_char,
+        func: GeometryCallbackFn,
+        user_context: usize,
+    ) -> ResultCode,
     #[cfg(feature = "vfs")]
     pub vfs_interface: VfsInterface,
 }

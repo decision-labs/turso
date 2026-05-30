@@ -27,9 +27,59 @@ use std::{
     sync::Arc,
 };
 use turso_ext::{
-    ContextDestructor, ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind,
-    VTabModuleImpl, ValueDestructor,
+    ContextDestructor, ExtensionApi, GeometryCallbackFn, InitAggFunction, ResultCode,
+    ScalarFunction, ScalarFunctionConnCtx, VTabKind, VTabModuleImpl, ValueDestructor,
 };
+
+/// Wrapper for scalar functions that also receive a connection context.
+/// Stores the user-provided context alongside the connection reference so the
+/// C callback can forward both to the Rust layer.
+struct ScalarWithCtx {
+    /// Packed `(geom_fn_ptr as usize << 16 | user_context)` — enough for both pointers.
+    packed: usize,
+    _conn: std::marker::PhantomData<Arc<Connection>>,
+}
+
+/// Registry of per-connection scalar functions that receive a connection context.
+/// Keyed by connection pointer identity (Arc::as_ptr as usize) → function name → wrapper.
+/// Uses `LazyLock` to avoid const-evaluation limitations.
+static SCALAR_WITH_CTX_REGISTRY: std::sync::LazyLock<
+    std::sync::RwLock<
+        std::collections::HashMap<usize, std::collections::HashMap<String, ScalarWithCtx>>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Unregister all functions associated with a given connection.
+/// Called when the connection is closed.
+pub(crate) fn unregister_connection_functions(conn: &Arc<Connection>) {
+    let mut registry = SCALAR_WITH_CTX_REGISTRY.write().unwrap();
+    let ptr = Arc::as_ptr(conn);
+    let ptr_usize = ptr as *const _ as usize;
+    registry.remove(&ptr_usize);
+}
+
+/// Set the current thread's connection context for `ScalarWithCtx` callbacks.
+/// This is called once per SQL function invocation before dispatching.
+pub(crate) fn set_current_conn_ctx(conn: Arc<Connection>) {
+    CURRENT_CONN_CTX.with(|ctx| ctx.replace(Some(conn)));
+}
+
+/// Clear the current thread's connection context.
+pub(crate) fn clear_current_conn_ctx() {
+    CURRENT_CONN_CTX.with(|ctx| ctx.replace(None));
+}
+
+pub(crate) fn get_current_conn_ctx() -> Option<Arc<Connection>> {
+    CURRENT_CONN_CTX.with(|ctx| ctx.borrow().clone())
+}
+/// Used by `ScalarWithCtx` callbacks to recover the connection without passing it
+/// through the C FFI boundary explicitly.
+///
+/// RefCell rather than Cell so we can call .borrow() without needing T: Copy.
+thread_local! {
+    static CURRENT_CONN_CTX: std::cell::RefCell<Option<Arc<Connection>>> = std::cell::RefCell::new(None);
+}
+pub use turso_ext::Value;
 pub use turso_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
 pub use vtab_xconnect::{execute, prepare_stmt};
 
@@ -138,6 +188,186 @@ pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
         if !ext_ctx.prepare_context_generation.is_null() {
             (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
         }
+    }
+    ResultCode::OK
+}
+
+pub(crate) unsafe extern "C" fn register_scalar_function_with_ctx(
+    ctx: *mut c_void,
+    name: *const c_char,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    callback: unsafe extern "C" fn(
+        context: usize,
+        conn: ScalarFunctionConnCtx,
+        argc: i32,
+        argv: *const Value,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Value,
+    context_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+) -> ResultCode {
+    if ctx.is_null() || name.is_null() || argc < -1 {
+        return ResultCode::InvalidArgs;
+    }
+    let c_str = unsafe { CStr::from_ptr(name) };
+    let name_str = match c_str.to_str() {
+        Ok(s) => crate::util::normalize_ident(s),
+        Err(_) => return ResultCode::InvalidArgs,
+    };
+    // The connection pointer (conn) is not known at registration time for static extensions —
+    // it's passed at invocation time in the per-connection registry.
+    // We register a C shim that extracts the connection from thread-local state and dispatches.
+    let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
+    unsafe {
+        (*ext_ctx.syms).functions.insert(
+            name_str.clone(),
+            Arc::new(ExternalFunc::new_scalar_with_ctx(
+                name_str,
+                argc,
+                deterministic,
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+            )),
+        );
+        if !ext_ctx.prepare_context_generation.is_null() {
+            (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
+        }
+    }
+    ResultCode::OK
+}
+
+/// Register an rtree geometry callback function on a connection.
+/// This is the entry point for `sqlite3_rtree_geometry_callback`.
+///
+/// The callback is registered as a SQL scalar function that produces a serialized
+/// MATCH blob when invoked. The blob encodes the callback pointer and user context,
+/// which `filter()` deserializes to invoke the geometry function per-cell.
+///
+/// The `geom_fn` is stored in the per-connection `SCALAR_WITH_CTX_REGISTRY` and
+/// dispatched through a shim that recovers the connection from `CURRENT_CONN_CTX`.
+pub(crate) unsafe extern "C" fn rtree_geometry_callback(
+    ctx: *mut c_void,
+    name: *const c_char,
+    geom_fn: GeometryCallbackFn,
+    user_context: usize,
+) -> ResultCode {
+    use crate::Value;
+
+    if ctx.is_null() || name.is_null() {
+        return ResultCode::Error;
+    }
+    let c_str = unsafe { CStr::from_ptr(name) };
+    let name_str = match c_str.to_str() {
+        Ok(s) => crate::util::normalize_ident(s),
+        Err(_) => return ResultCode::Error,
+    };
+
+    // Geometry callbacks are registered per-connection via the WITH_CTX mechanism.
+    // We get the connection from CURRENT_CONN_CTX at invocation time (set by the VDBE
+    // before calling any SQL function). We store the raw (geom_fn, user_context) in
+    // the registry; a dispatch shim retrieves them and calls geom_fn.
+    let mut registry = SCALAR_WITH_CTX_REGISTRY.write().unwrap();
+    let conn_ptr = (CURRENT_CONN_CTX
+        .with(|ctx| ctx.borrow().as_ref().map(|c| Arc::as_ptr(c) as usize)))
+    .unwrap_or(0usize);
+
+    if conn_ptr == 0 {
+        return ResultCode::Error;
+    }
+
+    let conn_funcs = registry.entry(conn_ptr).or_default();
+    // Pack both pointers into one usize (shift geom_fn to high bits, keep user_context in low bits).
+    // On 64-bit this gives plenty of space for both.
+    let packed = (geom_fn as usize) << 16 | (user_context & ((1 << 16) - 1));
+    conn_funcs.insert(
+        name_str.clone(),
+        ScalarWithCtx {
+            packed,
+            _conn: std::marker::PhantomData,
+        },
+    );
+
+    // Register a C shim that, when called, reads CURRENT_CONN_CTX, looks up the
+    // (geom_fn, user_context) from the registry, calls geom_fn(n_dim, coords, n_param,
+    // params, user_context, result), and returns a blob that the rtree MATCH filter decodes.
+    unsafe extern "C" fn geom_shim(
+        _context: usize,
+        _conn: ScalarFunctionConnCtx,
+        argc: i32,
+        argv: *const ExtValue,
+        _context_destructor: Option<ContextDestructor>,
+        _value_destructor: Option<ValueDestructor>,
+    ) -> ExtValue {
+        let args = std::slice::from_raw_parts(argv, argc as usize);
+
+        // Look up (geom_fn, user_context) from CURRENT_CONN_CTX's registry.
+        let (geom_fn, user_context) = match CURRENT_CONN_CTX.with(|ctx| ctx.borrow().clone()) {
+            Some(conn) => {
+                let conn_ptr = Arc::as_ptr(&conn) as *const _ as usize;
+                let registry = SCALAR_WITH_CTX_REGISTRY.read().unwrap();
+                match registry.get(&conn_ptr).and_then(|m| m.get("")) {
+                    Some(swctx) => {
+                        let geom_fn_ptr = swctx.packed >> 16;
+                        let geom_fn: GeometryCallbackFn =
+                            unsafe { std::mem::transmute(geom_fn_ptr) };
+                        let ctx = swctx.packed & ((1 << 16) - 1);
+                        (geom_fn, ctx)
+                    }
+                    None => return ExtValue::null(),
+                }
+            }
+            None => return ExtValue::null(),
+        };
+
+        // Pack into a MATCH blob: [4 iSize][8 geom_ptr][8 ctx_ptr][8 nParam][params...]
+        // geom_shim params come from SQL function args as f64 values.
+        let mut blob = Vec::with_capacity(4 + 8 + 8 + 8 + args.len() * 8);
+
+        // iSize placeholder (fix up after)
+        let size_placeholder = blob.len();
+        blob.extend_from_slice(&(0u32).to_le_bytes());
+
+        // geom_ptr
+        blob.extend_from_slice(&(geom_fn as usize as u64).to_le_bytes());
+
+        // context ptr
+        blob.extend_from_slice(&(user_context as u64).to_le_bytes());
+
+        // nParam
+        blob.extend_from_slice(&(args.len() as u64).to_le_bytes());
+
+        // params: SQL function arguments as f64 values
+        for arg in args {
+            blob.extend_from_slice(&arg.to_float().unwrap_or(0.0).to_le_bytes());
+        }
+
+        // Fix up iSize
+        let actual_size = blob.len() as u32;
+        blob[size_placeholder..size_placeholder + 4].copy_from_slice(&actual_size.to_le_bytes());
+
+        ExtValue::from_blob(blob)
+    }
+
+    // Insert the shim as a regular scalar function with ctx.
+    let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
+    unsafe {
+        (*ext_ctx.syms).functions.insert(
+            name_str.clone(),
+            Arc::new(ExternalFunc::new_scalar_with_ctx(
+                name_str,
+                -1,
+                false,
+                user_context,
+                geom_shim,
+                None,
+                None,
+            )),
+        );
     }
     ResultCode::OK
 }
@@ -268,9 +498,11 @@ impl Database {
         let mut ext_api = ExtensionApi {
             ctx: ctx as *mut c_void,
             register_scalar_function: register_scalar_function_with_options,
+            register_scalar_function_with_ctx: register_scalar_function_with_ctx,
             register_aggregate_function,
             unregister_function,
             register_vtab_module,
+            rtree_geometry_callback,
             #[cfg(feature = "fs")]
             vfs_interface: turso_ext::VfsInterface {
                 register_vfs: dynamic::register_vfs,
@@ -335,9 +567,11 @@ impl Connection {
         ExtensionApi {
             ctx,
             register_scalar_function: register_scalar_function_with_options,
+            register_scalar_function_with_ctx: register_scalar_function_with_ctx,
             register_aggregate_function,
             unregister_function,
             register_vtab_module,
+            rtree_geometry_callback,
             #[cfg(feature = "fs")]
             vfs_interface: turso_ext::VfsInterface {
                 register_vfs: dynamic::register_vfs,

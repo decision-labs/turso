@@ -155,8 +155,7 @@ impl GenerateSeriesCursor {
 
     /// True iff the cursor has advanced past the last valid row in its direction.
     fn current_past_stop(&self) -> bool {
-        (self.step > 0 && self.current > self.stop)
-            || (self.step < 0 && self.current < self.stop)
+        (self.step > 0 && self.current > self.stop) || (self.step < 0 && self.current < self.stop)
     }
 }
 

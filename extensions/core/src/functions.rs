@@ -14,6 +14,33 @@ pub type ScalarFunction = unsafe extern "C" fn(
     value_destructor: Option<ValueDestructor>,
 ) -> Value;
 
+/// `sqlite3_rtree_geometry_callback`-style geometry function signature.
+/// Called per-cell during rtree MATCH queries.
+///
+/// Parameters:
+/// - `n_dim`: number of dimensions (2 for 2D, 4 for 3D, etc.)
+/// - `coords`: pointer to cell bounding-box coordinates [xmin, xmax, ymin, ymax, ...]
+/// - `n_param`: number of user parameters (from the SQL function args)
+/// - `params`: pointer to user parameter values
+/// - `user_context`: opaque user-provided context from registration
+/// - `result`: output — the callback writes 1 to accept the cell, 0 to reject
+///
+/// Returns: 0 on error (constraint violated), non-zero to continue evaluation
+pub type GeometryCallbackFn = unsafe extern "C" fn(
+    n_dim: i32,
+    coords: *const f32,
+    n_param: i32,
+    params: *const f64,
+    user_context: usize,
+    result: *mut i32,
+) -> i32;
+
+/// Argument passed as `conn_ctx` to [`RegisterScalarFnWithCtx`] callbacks.
+/// This is an opaque pointer to the extension's `Conn` wrapper.
+/// Extensions cast this to `*const turso_ext::Conn` and wrap it in
+/// `Arc::new(Connection::new(ptr))` to get the full connection API.
+pub type ScalarFunctionConnCtx = *mut std::ffi::c_void;
+
 pub type RegisterScalarFn = unsafe extern "C" fn(
     ctx: *mut c_void,
     name: *const c_char,
@@ -21,6 +48,31 @@ pub type RegisterScalarFn = unsafe extern "C" fn(
     deterministic: bool,
     context: usize,
     func: ScalarFunction,
+    context_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+) -> ResultCode;
+
+/// Register a scalar function that receives a connection context as the second argument.
+/// The function signature is: `fn(context, conn: ScalarFunctionConnCtx, argc, argv, ...)`.
+///
+/// This is required for geometry callbacks like `sqlite3_rtree_geometry_callback` which
+/// need the connection to register auxiliary SQL state. The `conn` argument is an opaque
+/// pointer to the connection's extension handle; extensions should treat it as `*const Conn`
+/// and wrap it in `Arc::new(Connection::new(conn))` to access the prepared-statement API.
+pub type RegisterScalarFnWithCtx = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    name: *const c_char,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    func: unsafe extern "C" fn(
+        context: usize,
+        conn: ScalarFunctionConnCtx,
+        argc: i32,
+        argv: *const Value,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Value,
     context_destructor: Option<ContextDestructor>,
     value_destructor: Option<ValueDestructor>,
 ) -> ResultCode;

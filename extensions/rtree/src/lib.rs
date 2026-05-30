@@ -61,6 +61,8 @@ const RTREE_LE: u8 = b'B';
 const RTREE_LT: u8 = b'C';
 const RTREE_GE: u8 = b'D';
 const RTREE_GT: u8 = b'E';
+/// MATCH operator (0x46 == 'F'). Encoded in idx_str as 'F' + argv_index_nibble.
+const RTREE_MATCH: u8 = b'F';
 
 const NOT_WITHIN: i32 = 0;
 const PARTLY_WITHIN: i32 = 1;
@@ -88,6 +90,217 @@ fn value_to_owned(v: &Value) -> Value {
     }
 }
 
+// =============================================================================
+// Geometry callback registry for MATCH operator
+// =============================================================================
+
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+/// Per-registration state for a MATCH geometry callback.
+/// `x_geom` receives `(coords: &[f64], params: &[f64], result: &mut i32)`:
+/// - coords: cell bounding-box coordinates [xmin, xmax, ymin, ymax, ...]
+/// - params: values passed to the SQL function (e.g., circle center + radius)
+/// - result: write 1 (accept cell) or 0 (reject cell) here
+///
+/// This differs from SQLite's `sqlite3_rtree_geometry` interface which passes
+/// the full `sqlite3_rtree_geometry*` struct. We pass individual slices instead,
+/// which avoids the extension needing to understand our internal Connection type.
+pub struct RtreeGeomCallback {
+    pub x_geom: Box<dyn Fn(&[f32], &[f64], &mut i32) -> bool + Send + Sync>,
+    pub destructor: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+/// Per-connection registry of named MATCH geometry callbacks.
+/// Populated by `sqlite3_rtree_geometry_callback()` and consulted during `filter()`.
+struct RtreeGeomRegistry {
+    callbacks: HashMap<String, Arc<RtreeGeomCallback>>,
+}
+
+impl Default for RtreeGeomRegistry {
+    fn default() -> Self {
+        Self {
+            callbacks: HashMap::new(),
+        }
+    }
+}
+
+/// Global registry keyed by opaque connection pointer derived from Arc identity.
+/// Uses `usize` as key since `Arc::as_ptr` returns `*const Arc<T>` which is
+/// not `Send + Sync` on all `T` — we only use the pointer bits as identity key.
+static RTREE_GEOM_REGISTRY: std::sync::LazyLock<RwLock<HashMap<usize, RtreeGeomRegistry>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Register a geometry callback on a connection.
+/// This is the entry point for `sqlite3_rtree_geometry_callback`.
+/// Returns a unique `callback_id` string that the `geom_callback` SQL function
+/// will encode into the blob operand for MATCH.
+///
+/// The `x_geom` closure receives raw coordinate and parameter slices (no internal
+/// pointers) so the extension remains decoupled from Turso's Connection internals.
+fn register_geom_callback(
+    conn: &Arc<turso_ext::Connection>,
+    name: &str,
+    x_geom: Box<dyn Fn(&[f32], &[f64], &mut i32) -> bool + Send + Sync>,
+    destructor: Option<Box<dyn FnOnce() + Send + Sync>>,
+) {
+    let mut registry = RTREE_GEOM_REGISTRY.write().unwrap();
+    // Cast Arc identity to opaque usize — Arc::as_ptr returns *const Arc<T>
+    let conn_ptr = Arc::as_ptr(conn) as usize;
+    let conn_registry = registry.entry(conn_ptr).or_default();
+    conn_registry.callbacks.insert(
+        name.to_string(),
+        Arc::new(RtreeGeomCallback { x_geom, destructor }),
+    );
+}
+
+/// Look up a geometry callback by name for a given connection.
+fn get_geom_callback(
+    conn: &Arc<turso_ext::Connection>,
+    name: &str,
+) -> Option<Arc<RtreeGeomCallback>> {
+    let registry = RTREE_GEOM_REGISTRY.read().unwrap();
+    let conn_ptr = Arc::as_ptr(conn) as usize;
+    registry.get(&conn_ptr)?.callbacks.get(name).cloned()
+}
+
+/// Remove all geometry callbacks registered on a connection.
+/// Called when the connection is closed.
+fn unregister_geom_callbacks(conn: &Arc<turso_ext::Connection>) {
+    let mut registry = RTREE_GEOM_REGISTRY.write().unwrap();
+    let conn_ptr = Arc::as_ptr(conn) as usize;
+    registry.remove(&conn_ptr);
+}
+
+/// SQL scalar function implementing the `circle` and similar geometry callbacks.
+/// Called by the MATCH operator as: `WHERE id MATCH my_geom_callback(?1, ?2, ...)`
+///
+/// This function does NOT receive the connection directly — the `conn_ptr` is
+/// embedded in the blob at registration time by `geom_callback_impl`.
+unsafe extern "C" fn geom_callback_sql(
+    _context: usize,
+    argc: i32,
+    argv: *const turso_ext::Value,
+    _context_destructor: Option<turso_ext::ContextDestructor>,
+    _value_destructor: Option<turso_ext::ValueDestructor>,
+) -> turso_ext::Value {
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+
+    // Extract (conn_ptr, callback_name, params_slice) from the first argument blob.
+    // Serialization format: [8 bytes: conn_ptr] [4 bytes: name_len] [N bytes: name] [8*N bytes: params]
+    let blob = match args.first().and_then(|v| v.blob_ref()) {
+        Some(b) => b,
+        None => {
+            return turso_ext::Value::null();
+        }
+    };
+
+    if blob.len() < 12 || blob.len() > 65536 {
+        return turso_ext::Value::null();
+    }
+
+    let conn_ptr: usize = u64::from_le_bytes([
+        blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7],
+    ]) as usize;
+    let name_len = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]) as usize;
+    if blob.len() < 12 + name_len {
+        return turso_ext::Value::null();
+    }
+    let name_bytes = &blob[12..12 + name_len];
+    let name = match std::str::from_utf8(name_bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => return turso_ext::Value::null(),
+    };
+    let params_start = 12 + name_len;
+    let params_len = (blob.len() - params_start) / 8;
+    let params = &blob[params_start..];
+    let params: Vec<f64> = params
+        .chunks_exact(8)
+        .take(params_len)
+        .map(|chunk| {
+            f64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        })
+        .collect();
+
+    // Look up callback in registry using the stored conn_ptr.
+    let registry = RTREE_GEOM_REGISTRY.read().unwrap();
+    let callbacks = match registry.get(&conn_ptr) {
+        Some(r) => &r.callbacks,
+        None => return turso_ext::Value::null(),
+    };
+    let callback = match callbacks.get(&name) {
+        Some(cb) => cb,
+        None => return turso_ext::Value::null(),
+    };
+
+    // Build the serialized blob for MATCH: this is what the vtab filter will deserialize.
+    // Format matches `RtreeMatchArg` from `ext/rtree/rtree.c`:
+    // [4 bytes: iSize LE] [8 bytes: x_geom ptr] [8 bytes: context ptr] [8 bytes: nParam LE]
+    // [8*nParam bytes: params]
+    //
+    // iSize is the total blob size (stored as u32 for SQLite compat). We cap at u32::MAX
+    // since the blob is always much smaller than 4GB. The actual size field is not critical
+    // for Turso's MATCH implementation — the filter only reads the fields it needs directly.
+    let n_param = params.len();
+    let mut result_blob = Vec::with_capacity(4 + 8 + 8 + 8 + n_param * 8);
+    result_blob.extend_from_slice(&(u32::MAX as usize).to_le_bytes()); // iSize (placeholder)
+                                                                       // Store pointer to the Arc<RtreeGeomCallback> as x_geom "pointer"
+    let geom_ptr = Arc::into_raw(callback.clone()) as usize;
+    result_blob.extend_from_slice(&geom_ptr.to_le_bytes());
+    // context ptr = conn_ptr (unused for lookup, already encoded in registry)
+    result_blob.extend_from_slice(&conn_ptr.to_le_bytes());
+    // nParam
+    result_blob.extend_from_slice(&(n_param as u64).to_le_bytes());
+    // params
+    for p in &params {
+        result_blob.extend_from_slice(&p.to_le_bytes());
+    }
+    // Fix up iSize with actual written size
+    let actual_size = result_blob.len();
+    result_blob[0..4].copy_from_slice(&(actual_size as u32).to_le_bytes());
+
+    turso_ext::Value::from_blob(result_blob)
+}
+
+/// Register the built-in `circle` geometry callback on a connection.
+/// This provides a pre-built MATCH function so users don't need to register one.
+fn register_builtin_circle_callback(conn: &Arc<turso_ext::Connection>) {
+    register_geom_callback(
+        conn,
+        "circle",
+        Box::new(|coords, params, result| {
+            // circle(x0, y0, r): accept cell if cell bbox intersects circle centered at (x0, y0) with radius r.
+            // Simple test: cell center is within (r + max_half_extent) of center.
+            if params.len() < 3 || coords.len() < 4 {
+                *result = 0;
+                return false;
+            }
+            let x0 = params[0] as f64;
+            let y0 = params[1] as f64;
+            let r = params[2] as f64;
+
+            let cx = ((coords[0] + coords[1]) / 2.0) as f64;
+            let cy = ((coords[2] + coords[3]) / 2.0) as f64;
+            let half_extent = ((coords[1] - coords[0]).max(coords[3] - coords[2]) / 2.0) as f64;
+
+            let dx = cx - x0;
+            let dy = cy - y0;
+            let dist_sq = dx * dx + dy * dy;
+            let threshold = (r + half_extent) * (r + half_extent);
+
+            *result = if dist_sq <= threshold { 1 } else { 0 };
+            true
+        }),
+        None,
+    );
+}
+
+// =============================================================================
+// End geometry callback registry
+// =============================================================================
+
 fn constraint_op_to_rtree_op(op: ConstraintOp) -> Option<u8> {
     match op {
         ConstraintOp::Eq => Some(RTREE_EQ),
@@ -95,8 +308,22 @@ fn constraint_op_to_rtree_op(op: ConstraintOp) -> Option<u8> {
         ConstraintOp::Lt => Some(RTREE_LT),
         ConstraintOp::Ge => Some(RTREE_GE),
         ConstraintOp::Gt => Some(RTREE_GT),
+        ConstraintOp::Match => Some(RTREE_MATCH),
         _ => None,
     }
+}
+
+/// Describes a constraint to apply against each cell during the rtree scan.
+/// For MATCH constraints, `value` is unused and `match_info` carries the
+/// deserialized geometry callback blob.
+#[derive(Debug)]
+struct RtreeConstraint {
+    i_coord: usize,
+    op: u8,
+    value: f64,
+    /// Serialized MATCH blob: [4 bytes iSize][8 bytes geom_ptr][8 bytes ctx][8 bytes nParam][params...]
+    /// Only populated when op == RTREE_MATCH. Empty Vec means not a MATCH constraint.
+    match_blob: Vec<u8>,
 }
 
 #[derive(Debug, VTabModuleDerive, Default)]
@@ -1476,13 +1703,6 @@ impl RtreeCursor {
     }
 }
 
-#[derive(Debug)]
-struct RtreeConstraint {
-    i_coord: usize,
-    op: u8,
-    value: f64,
-}
-
 fn leaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize) -> i32 {
     let coord_idx = constraint.i_coord;
     if coord_idx >= n_dim2 * 2 {
@@ -1537,6 +1757,36 @@ fn leaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize
                 NOT_WITHIN
             } else {
                 FULLY_WITHIN
+            }
+        }
+        b'F' => {
+            // MATCH geometry callback: deserialize blob and invoke x_geom.
+            // Blob format: [4 iSize][8 geom_ptr][8 ctx][8 nParam][nParam*f64 params]
+            if constraint.match_blob.len() < 28 {
+                NOT_WITHIN
+            } else {
+                let geom_ptr = u64::from_le_bytes(constraint.match_blob[4..12].try_into().unwrap())
+                    as *const Arc<RtreeGeomCallback>;
+                let n_param =
+                    u64::from_le_bytes(constraint.match_blob[20..28].try_into().unwrap()) as usize;
+                let param_start = 28;
+                let param_end = param_start + n_param * 8;
+                if constraint.match_blob.len() < param_end {
+                    NOT_WITHIN
+                } else {
+                    let params: Vec<f64> = constraint.match_blob[param_start..param_end]
+                        .chunks_exact(8)
+                        .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+                        .collect();
+                    let callback = unsafe { &*geom_ptr };
+                    let mut result: i32 = 0;
+                    let accepted = (callback.x_geom)(&cell.coords[..n_dim2], &params, &mut result);
+                    if accepted && result != 0 {
+                        FULLY_WITHIN
+                    } else {
+                        NOT_WITHIN
+                    }
+                }
             }
         }
         _ => FULLY_WITHIN,
@@ -1595,6 +1845,35 @@ fn nonleaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: us
                 NOT_WITHIN
             } else {
                 FULLY_WITHIN
+            }
+        }
+        b'F' => {
+            // MATCH for non-leaf (internal) cells: same logic as leaf.
+            if constraint.match_blob.len() < 28 {
+                NOT_WITHIN
+            } else {
+                let geom_ptr = u64::from_le_bytes(constraint.match_blob[4..12].try_into().unwrap())
+                    as *const Arc<RtreeGeomCallback>;
+                let n_param =
+                    u64::from_le_bytes(constraint.match_blob[20..28].try_into().unwrap()) as usize;
+                let param_start = 28;
+                let param_end = param_start + n_param * 8;
+                if constraint.match_blob.len() < param_end {
+                    NOT_WITHIN
+                } else {
+                    let params: Vec<f64> = constraint.match_blob[param_start..param_end]
+                        .chunks_exact(8)
+                        .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+                        .collect();
+                    let callback = unsafe { &*geom_ptr };
+                    let mut result: i32 = 0;
+                    let accepted = (callback.x_geom)(&cell.coords[..n_dim2], &params, &mut result);
+                    if accepted && result != 0 {
+                        FULLY_WITHIN
+                    } else {
+                        NOT_WITHIN
+                    }
+                }
             }
         }
         _ => FULLY_WITHIN,
@@ -1968,76 +2247,76 @@ impl VTable for RtreeTable {
     }
 
     fn insert(
-            &mut self,
-            conn: Option<Arc<Connection>>,
-            rowid: Option<i64>,
-            args: &[Value],
-            conflict_action: Option<u16>,
-        ) -> Result<i64, Self::Error> {
-            let Some(conn) = conn else {
-                return Err(ResultCode::InvalidArgs);
-            };
-            // `args` is the column slice (xUpdate argv[2..]): rowid-alias slot, coord pairs, then optional aux.
-            let required = self.n_dim2 + 1 + self.aux_columns.len();
-            if args.len() < required {
-                return Err(ResultCode::InvalidArgs);
-            }
-
-            // Resolve the rowid. Core carries it in `rowid` (argv[1]); SQLite reads the same value from the first
-            // column (`aData[2]`). Fall back to the column slot, then to an internal counter for auto-assignment.
-            let rowid = rowid
-                .or_else(|| args.first().and_then(|v| v.to_integer()))
-                .unwrap_or_else(|| self.row_count + 1);
-
-            // Build the cell and enforce coord1 <= coord2 per dimension (`rtreeConstraintError` in rtree.c).
-            let mut cell = RtreeCell::new(rowid);
-            for i in 0..self.n_dim2 {
-                if self.coord_type == 1 {
-                    // INT32: read as integer and convert to f32
-                    if let Some(val) = args[i + 1].to_integer() {
-                        cell.coords[i] = val as f32;
-                    }
-                } else {
-                    // REAL32 (default): read as float
-                    if let Some(val) = args[i + 1].to_float() {
-                        cell.coords[i] = val as f32;
-                    }
-                }
-            }
-            for d in 0..(self.n_dim2 / 2) {
-                if cell.coords[2 * d] > cell.coords[2 * d + 1] {
-                    return Err(ResultCode::ConstraintViolation);
-                }
-            }
-
-            // ON CONFLICT handling: check for duplicate rowid
-            if self.node_count > 0 {
-                if let Some(_existing) = self.get_rowid_nodeno(&conn, rowid)? {
-                    match conflict_action {
-                        Some(5) => {
-                            // REPLACE: delete the existing row and insert the new one
-                            self.delete(Some(conn.clone()), rowid)?;
-                        }
-                        Some(4) => {
-                            // IGNORE: silently skip this insert
-                            return Ok(rowid);
-                        }
-                        _ => {
-                            // ABORT/FAIL/ROLLBACK: return constraint violation
-                            return Err(ResultCode::ConstraintViolation);
-                        }
-                    }
-                }
-            }
-
-            // Only advance the auto-assign high-water mark once the row is known good, so failed inserts don't perturb
-            // the next NULL-rowid assignment.
-            self.row_count = self.row_count.max(rowid);
-            let aux = &args[self.n_dim2 + 1..required];
-            self.insert_leaf_row(&conn, rowid, &cell, aux)?;
-
-            Ok(rowid)
+        &mut self,
+        conn: Option<Arc<Connection>>,
+        rowid: Option<i64>,
+        args: &[Value],
+        conflict_action: Option<u16>,
+    ) -> Result<i64, Self::Error> {
+        let Some(conn) = conn else {
+            return Err(ResultCode::InvalidArgs);
+        };
+        // `args` is the column slice (xUpdate argv[2..]): rowid-alias slot, coord pairs, then optional aux.
+        let required = self.n_dim2 + 1 + self.aux_columns.len();
+        if args.len() < required {
+            return Err(ResultCode::InvalidArgs);
         }
+
+        // Resolve the rowid. Core carries it in `rowid` (argv[1]); SQLite reads the same value from the first
+        // column (`aData[2]`). Fall back to the column slot, then to an internal counter for auto-assignment.
+        let rowid = rowid
+            .or_else(|| args.first().and_then(|v| v.to_integer()))
+            .unwrap_or_else(|| self.row_count + 1);
+
+        // Build the cell and enforce coord1 <= coord2 per dimension (`rtreeConstraintError` in rtree.c).
+        let mut cell = RtreeCell::new(rowid);
+        for i in 0..self.n_dim2 {
+            if self.coord_type == 1 {
+                // INT32: read as integer and convert to f32
+                if let Some(val) = args[i + 1].to_integer() {
+                    cell.coords[i] = val as f32;
+                }
+            } else {
+                // REAL32 (default): read as float
+                if let Some(val) = args[i + 1].to_float() {
+                    cell.coords[i] = val as f32;
+                }
+            }
+        }
+        for d in 0..(self.n_dim2 / 2) {
+            if cell.coords[2 * d] > cell.coords[2 * d + 1] {
+                return Err(ResultCode::ConstraintViolation);
+            }
+        }
+
+        // ON CONFLICT handling: check for duplicate rowid
+        if self.node_count > 0 {
+            if let Some(_existing) = self.get_rowid_nodeno(&conn, rowid)? {
+                match conflict_action {
+                    Some(5) => {
+                        // REPLACE: delete the existing row and insert the new one
+                        self.delete(Some(conn.clone()), rowid)?;
+                    }
+                    Some(4) => {
+                        // IGNORE: silently skip this insert
+                        return Ok(rowid);
+                    }
+                    _ => {
+                        // ABORT/FAIL/ROLLBACK: return constraint violation
+                        return Err(ResultCode::ConstraintViolation);
+                    }
+                }
+            }
+        }
+
+        // Only advance the auto-assign high-water mark once the row is known good, so failed inserts don't perturb
+        // the next NULL-rowid assignment.
+        self.row_count = self.row_count.max(rowid);
+        let aux = &args[self.n_dim2 + 1..required];
+        self.insert_leaf_row(&conn, rowid, &cell, aux)?;
+
+        Ok(rowid)
+    }
 
     fn delete(&mut self, conn: Option<Arc<Connection>>, rowid: i64) -> Result<(), Self::Error> {
         let Some(conn) = conn else {
@@ -2245,11 +2524,23 @@ impl VTabCursor for RtreeCursor {
             let coord_idx = (coord_digit as usize) - (b'0' as usize);
 
             if arg_idx < args.len() {
-                if let Some(f) = args[arg_idx].to_float() {
+                let arg = &args[arg_idx];
+                if op == RTREE_MATCH {
+                    // MATCH constraint: operand is a blob containing the geometry callback info.
+                    if let Some(blob) = arg.blob_ref() {
+                        self.constraints.push(RtreeConstraint {
+                            i_coord: coord_idx,
+                            op,
+                            value: 0.0,
+                            match_blob: blob.to_vec(),
+                        });
+                    }
+                } else if let Some(f) = arg.to_float() {
                     self.constraints.push(RtreeConstraint {
                         i_coord: coord_idx,
                         op,
                         value: f,
+                        match_blob: Vec::new(),
                     });
                 }
             }
@@ -2639,6 +2930,7 @@ mod tests {
             i_coord: 0,
             op: b'E',
             value: 15.0,
+            match_blob: Vec::new(),
         };
 
         let result = leaf_constraint(&constraint, &test_cell, 4);
@@ -2657,6 +2949,7 @@ mod tests {
             i_coord: 0,
             op: b'B',
             value: 4.0,
+            match_blob: Vec::new(),
         };
 
         let result = nonleaf_constraint(&constraint, &test_cell, 4);

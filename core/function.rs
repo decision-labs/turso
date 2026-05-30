@@ -1,10 +1,11 @@
 use crate::sync::Arc;
+use std::cell::Cell;
 use std::fmt;
 use std::fmt::{Debug, Display};
 use strum::IntoEnumIterator;
 use turso_ext::{
-    ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
-    ValueDestructor,
+    ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction, ScalarFunctionConnCtx,
+    StepFunction, Value, ValueDestructor,
 };
 
 use crate::LimboError;
@@ -69,6 +70,7 @@ impl Deterministic for ExternalFunc {
     fn is_deterministic(&self) -> bool {
         match self.func {
             ExtFunc::Scalar { deterministic, .. } => deterministic,
+            ExtFunc::ScalarWithCtx { deterministic, .. } => deterministic,
             _ => false,
         }
     }
@@ -81,6 +83,24 @@ pub enum ExtFunc {
         argc: i32,
         deterministic: bool,
         callback: ScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    },
+    /// Scalar function that receives a connection context at invocation time.
+    /// The connection is stored in a thread-local and forwarded to the callback as the
+    /// second argument (after `context`).
+    ScalarWithCtx {
+        context: usize,
+        argc: i32,
+        deterministic: bool,
+        callback: unsafe extern "C" fn(
+            context: usize,
+            conn: ScalarFunctionConnCtx,
+            argc: i32,
+            argv: *const Value,
+            context_destructor: Option<ContextDestructor>,
+            value_destructor: Option<ValueDestructor>,
+        ) -> Value,
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
     },
@@ -107,6 +127,7 @@ impl ExtFunc {
     pub fn matches_arg_count(&self, arg_count: usize) -> bool {
         match self {
             Self::Scalar { argc, .. } => *argc < 0 || *argc as usize == arg_count,
+            Self::ScalarWithCtx { argc, .. } => *argc < 0 || *argc as usize == arg_count,
             Self::Aggregate { argc, .. } => *argc < 0 || *argc as usize == arg_count,
         }
     }
@@ -182,6 +203,40 @@ impl ExternalFunc {
                 finalize: func.2,
                 context_destructor,
                 aggregate_destructor,
+                value_destructor,
+            },
+        }
+    }
+
+    /// Create a scalar function that receives a connection context at invocation time.
+    /// The `callback` signature is: `fn(context, conn: ScalarFunctionConnCtx, argc, argv, ...)`.
+    ///
+    /// The connection context is stored in a thread-local `Cell` and read by the C shim
+    /// that wraps the callback before dispatching into Rust.
+    pub fn new_scalar_with_ctx(
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: unsafe extern "C" fn(
+            context: usize,
+            conn: ScalarFunctionConnCtx,
+            argc: i32,
+            argv: *const Value,
+            context_destructor: Option<ContextDestructor>,
+            value_destructor: Option<ValueDestructor>,
+        ) -> Value,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Self {
+        Self {
+            name,
+            func: ExtFunc::ScalarWithCtx {
+                context,
+                argc,
+                deterministic,
+                callback,
+                context_destructor,
                 value_destructor,
             },
         }

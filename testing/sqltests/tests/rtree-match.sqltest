@@ -1,0 +1,57 @@
+@database :memory:
+
+# Test MATCH with a circle geometry callback.
+# The callback receives (x0,y0,radius) and returns true if the cell bbox intersects the circle.
+# We implement a simple circle test: sqrt((cx-x0)^2 + (cy-y0)^2) < r + max(cell_half_extent)
+
+setup rtree-match-circle {
+    CREATE VIRTUAL TABLE rt2 USING rtree(id, xmin, xmax, ymin, ymax);
+    INSERT INTO rt2 VALUES(1, 0.0, 10.0, 0.0, 10.0);
+    INSERT INTO rt2 VALUES(2, 5.0,  8.0, 5.0,  8.0);
+    INSERT INTO rt2 VALUES(3, 20.0, 30.0, 20.0, 30.0);
+    INSERT INTO rt2 VALUES(4, 25.0, 35.0, 25.0, 35.0);
+}
+
+# Circle centered at (6, 6) radius 5 should intersect cells 1 (0-10,0-10) and 2 (5-8,5-8)
+# Cell 3 (20-30,20-30) and cell 4 (25-35,25-35) are too far away.
+@setup rtree-match-circle
+test match-circle-intersects {
+    SELECT id FROM rt2 WHERE id MATCH circle(6.0, 6.0, 5.0);
+}
+expect {
+    1
+    2
+}
+
+@setup rtree-match-circle
+test match-circle-no-results {
+    SELECT id FROM rt2 WHERE id MATCH circle(100.0, 100.0, 1.0);
+}
+expect {
+}
+
+# Multiple MATCH constraints (AND)
+@setup rtree-match-circle
+test match-circle-and-bounding-box {
+    SELECT id FROM rt2 WHERE id MATCH circle(6.0, 6.0, 5.0) AND xmin > 4.0;
+}
+expect {
+    2
+}
+
+# rtree_i32 variant
+setup rtree-i32-match-circle {
+    CREATE VIRTUAL TABLE rt3 USING rtree_i32(id, xmin, xmax, ymin, ymax);
+    INSERT INTO rt3 VALUES(1, 0, 10, 0, 10);
+    INSERT INTO rt3 VALUES(2, 5,  8, 5,  8);
+    INSERT INTO rt3 VALUES(3, 20, 30, 20, 30);
+}
+
+@setup rtree-i32-match-circle
+test match-circle-i32 {
+    SELECT id FROM rt3 WHERE id MATCH circle(6, 6, 5);
+}
+expect {
+    1
+    2
+}

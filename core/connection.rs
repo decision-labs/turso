@@ -3886,6 +3886,7 @@ impl Connection {
                 let argc = match &f.func {
                     function::ExtFunc::Aggregate { argc, .. } => *argc,
                     function::ExtFunc::Scalar { argc, .. } => *argc,
+                    function::ExtFunc::ScalarWithCtx { argc, .. } => *argc,
                 };
                 (
                     f.name.clone(),

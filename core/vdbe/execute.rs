@@ -8730,6 +8730,53 @@ pub fn op_function(
                 }
                 state.registers[*dest].set_value(value?);
             }
+            ExtFunc::ScalarWithCtx {
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+                ..
+            } => {
+                // Set CURRENT_CONN_CTX so the geom_shim can look up the registered geom_fn.
+                let conn = state.connection.as_ref().unwrap().clone();
+                crate::ext::set_current_conn_ctx(conn.clone());
+                let conn_ctx = crate::ext::get_current_conn_ctx();
+                let mut ext_values = Vec::with_capacity(arg_count);
+                if arg_count != 0 {
+                    let register_slice = &state.registers[*start_reg..*start_reg + arg_count];
+                    for ov in register_slice.iter() {
+                        ext_values.push(ov.get_value().to_ffi());
+                    }
+                }
+                let argv_ptr = if ext_values.is_empty() {
+                    std::ptr::null()
+                } else {
+                    ext_values.as_ptr()
+                };
+                let conn = Arc::as_ptr(&conn) as *mut std::ffi::c_void;
+                let mut result = unsafe {
+                    callback(
+                        context,
+                        conn,
+                        arg_count as i32,
+                        argv_ptr,
+                        context_destructor,
+                        value_destructor,
+                    )
+                };
+                // Clear CURRENT_CONN_CTX after the call.
+                crate::ext::clear_current_conn_ctx();
+                let value = Value::from_ffi_ref(&result);
+                if let Some(value_destructor) = value_destructor {
+                    unsafe { value_destructor(&mut result) };
+                } else {
+                    unsafe { result.__free_internal_type() };
+                }
+                for ext_value in ext_values {
+                    unsafe { ext_value.__free_internal_type() };
+                }
+                state.registers[*dest].set_value(value?);
+            }
             _ => unreachable!("aggregate called in scalar context"),
         },
         crate::function::Func::Math(math_func) => match math_func.arity() {

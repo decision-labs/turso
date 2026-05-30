@@ -1,6 +1,7 @@
 use crate::{
     ext::{
-        register_aggregate_function, register_scalar_function_with_options, register_vtab_module,
+        register_aggregate_function, register_scalar_function_with_ctx,
+        register_scalar_function_with_options, register_vtab_module, rtree_geometry_callback,
         unregister_function,
     },
     Connection, LimboError,
@@ -109,9 +110,11 @@ pub fn add_builtin_vfs_extensions(
         None => ExtensionApi {
             ctx: std::ptr::null_mut(),
             register_scalar_function: register_scalar_function_with_options,
+            register_scalar_function_with_ctx: register_scalar_function_with_ctx,
             register_aggregate_function,
             unregister_function,
             register_vtab_module,
+            rtree_geometry_callback,
             vfs_interface: VfsInterface {
                 register_vfs,
                 builtin_vfs: vfslist.as_mut_ptr(),
