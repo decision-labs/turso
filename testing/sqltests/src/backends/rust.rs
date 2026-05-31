@@ -150,7 +150,7 @@ impl SqlBackend for RustBackend {
             let ext_conn = unsafe { Arc::from_raw(ext_conn) };
             limbo_rtree::register_builtin_circle_callback(&ext_conn);
             // Re-anchor the Arc so it doesn't drop the connection when this scope ends
-            Arc::into_raw(ext_conn);
+            let _ = Arc::into_raw(ext_conn);
         }
 
         // Prepend MVCC pragma if enabled (skip for readonly databases; the generated readonly DBs are already in MVCC mode).
