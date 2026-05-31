@@ -274,6 +274,9 @@ impl Limbo {
                     "Failed to register completion extension".to_string()
                 ));
             }
+            if !limbo_rtree::register_extension_static(&mut ext_api).is_ok() {
+                return Err(anyhow!("Failed to register rtree extension".to_string()));
+            }
             conn._free_extension_ctx(ext_api);
         }
         let interrupt_count = Arc::new(AtomicUsize::new(0));

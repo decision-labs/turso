@@ -133,6 +133,20 @@ impl Connection {
         Ok(())
     }
 
+    /// Build the extension API for registering extension functions, vtab modules,
+    /// and rtree geometry callbacks on this connection.
+    ///
+    /// Use this to register extensions that are not enabled via experimental features.
+    /// The caller must not use the returned ExtensionApi after the connection is closed.
+    ///
+    /// # Safety
+    ///
+    /// The returned `ExtensionApi` must not be used after the connection is dropped.
+    pub fn extension_api(&self) -> Result<turso_ext::ExtensionApi> {
+        let conn = self.get_inner_connection()?;
+        Ok(conn.extension_api())
+    }
+
     /// Prepare a SQL statement for later execution.
     pub async fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
         let conn = self.get_inner_connection()?;

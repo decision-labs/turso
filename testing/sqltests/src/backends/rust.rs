@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use turso::{Builder, Connection, Database, Value};
+use turso_ext::ResultCode;
 
 const TURSO_RUST_EXPERIMENTAL_FEATURES: &[&str] = &[
     "attach",
@@ -130,6 +131,21 @@ impl SqlBackend for RustBackend {
         let conn = db
             .connect()
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
+
+        // Register rtree extension (vtabs + circle geometry callback)
+        {
+            let mut ext_api = conn.extension_api().map_err(|e| {
+                BackendError::CreateDatabase(format!("failed to get extension API: {e}"))
+            })?;
+            // SAFETY: limbo_rtree has no global state and is safe to register statically.
+            unsafe {
+                if limbo_rtree::register_extension_static(&mut ext_api) != ResultCode::OK {
+                    return Err(BackendError::CreateDatabase(
+                        "failed to register rtree extension".to_string(),
+                    ));
+                }
+            }
+        }
 
         // Prepend MVCC pragma if enabled (skip for readonly databases; the generated readonly DBs are already in MVCC mode).
         if self.mvcc && !config.readonly {

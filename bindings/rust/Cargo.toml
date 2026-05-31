@@ -16,7 +16,8 @@ workspace = true
 default = ["mimalloc", "fts"]
 mimalloc = ["dep:mimalloc"]
 pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
-fts = ["turso_sdk_kit/fts"]
+fts = ["turso_sdk_kit/fts", "turso_core/fts"]
+rtree = ["turso_core/rtree"]
 stacker = ["turso_core/stacker"]
 test_helper = ["turso_core/test_helper"]
 # Test-only: exposes the `memory_yield` VFS for stress/simulator harnesses.
@@ -32,6 +33,7 @@ sync = [
 
 [dependencies]
 turso_core = { workspace = true }
+turso_ext = { workspace = true, features = ["core_only"] }
 turso_sdk_kit = { workspace = true }
 turso_sync_sdk_kit = { workspace = true }
 thiserror = { workspace = true }

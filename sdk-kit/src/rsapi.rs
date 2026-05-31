@@ -1066,6 +1066,15 @@ impl TursoConnection {
         Ok(())
     }
 
+    /// Build the extension API for registering extension functions, vtab modules,
+    /// and rtree geometry callbacks on this connection.
+    pub fn extension_api(&self) -> turso_ext::ExtensionApi {
+        // SAFETY: `_build_turso_ext` returns a valid ExtensionApi for the lifetime of
+        // this connection. The caller must not use the returned ExtensionApi after the
+        // connection is closed or dropped.
+        unsafe { self.connection._build_turso_ext() }
+    }
+
     /// helper method to get C raw container to the TursoConnection instance
     /// this method is used in the capi wrappers
     pub fn to_capi(self: Arc<Self>) -> *mut capi::c::turso_connection_t {

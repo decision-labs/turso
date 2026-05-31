@@ -6065,6 +6065,7 @@ dependencies = [
  "glob",
  "indicatif",
  "itertools 0.14.0",
+ "limbo_rtree",
  "logos",
  "miette",
  "num_cpus",
@@ -6081,6 +6082,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tokio",
  "turso",
+ "turso_ext",
  "turso_parser",
 ]
 
@@ -6573,6 +6575,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso_core",
+ "turso_ext",
  "turso_sdk_kit",
  "turso_sync_sdk_kit",
 ]
@@ -6615,6 +6618,7 @@ dependencies = [
  "itertools 0.14.0",
  "libc",
  "limbo_completion",
+ "limbo_rtree",
  "miette",
  "mimalloc",
  "nu-ansi-term",

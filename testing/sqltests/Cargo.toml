@@ -56,7 +56,13 @@ rand_chacha = { workspace = true }
 # Turso Rust bindings.
 # `test_helper` exposes test-only SQL functions (e.g. test_nondet_counter)
 # that the sqltests use to observe planner behavior.
-turso = { workspace = true, features = ["test_helper"] }
+turso = { workspace = true, features = ["test_helper", "rtree"] }
+
+# RTree extension (for MATCH geometry callbacks like circle)
+limbo_rtree = { workspace = true, features = ["static"] }
+
+# turso_ext types (ResultCode) used when registering limbo_rtree
+turso_ext = { workspace = true }
 
 # Turso SQL parser (for splitting multi-statement SQL)
 turso_parser = { workspace = true }

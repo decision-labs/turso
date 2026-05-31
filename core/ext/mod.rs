@@ -61,23 +61,42 @@ pub(crate) fn unregister_connection_functions(conn: &Arc<Connection>) {
 /// Set the current thread's connection context for `ScalarWithCtx` callbacks.
 /// This is called once per SQL function invocation before dispatching.
 pub(crate) fn set_current_conn_ctx(conn: Arc<Connection>) {
-    CURRENT_CONN_CTX.with(|ctx| ctx.replace(Some(conn)));
+    CURRENT_CONN_CTX.with(|ctx| ctx.set(Some(conn)));
 }
 
-/// Clear the current thread's connection context.
 pub(crate) fn clear_current_conn_ctx() {
-    CURRENT_CONN_CTX.with(|ctx| ctx.replace(None));
+    CURRENT_CONN_CTX.with(|ctx| ctx.set(None));
 }
 
 pub(crate) fn get_current_conn_ctx() -> Option<Arc<Connection>> {
-    CURRENT_CONN_CTX.with(|ctx| ctx.borrow().clone())
+    CURRENT_CONN_CTX.with(|ctx| ctx.take())
 }
-/// Used by `ScalarWithCtx` callbacks to recover the connection without passing it
-/// through the C FFI boundary explicitly.
-///
-/// RefCell rather than Cell so we can call .borrow() without needing T: Copy.
+
+/// Thread-local storing the current connection during scalar function invocation.
+/// Uses `Cell` (not `RefCell`) because we only ever set/clear/replace — never
+/// nest borrows. `RefCell`'s borrow checking can cause stack overflow when
+/// `geom_shim` is called re-entrantly from deep VDBE dispatch chains.
 thread_local! {
-    static CURRENT_CONN_CTX: std::cell::RefCell<Option<Arc<Connection>>> = std::cell::RefCell::new(None);
+    static CURRENT_CONN_CTX: std::cell::Cell<Option<Arc<Connection>>> = std::cell::Cell::new(None);
+}
+
+/// Thread-local storing the current geometry callback name for rtree geometry callbacks.
+/// Set by `rtree_geometry_callback` before registering the shim, and read by `geom_shim`
+/// when invoked to look up the correct (geom_fn, user_context) from the registry.
+thread_local! {
+    static CURRENT_GEOM_NAME: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+}
+
+pub(crate) fn set_current_geom_name(name: String) {
+    CURRENT_GEOM_NAME.with(|ctx| ctx.set(Some(name)));
+}
+
+pub(crate) fn clear_current_geom_name() {
+    CURRENT_GEOM_NAME.with(|ctx| ctx.set(None));
+}
+
+pub(crate) fn take_current_geom_name() -> Option<String> {
+    CURRENT_GEOM_NAME.with(|ctx| ctx.take())
 }
 pub use turso_ext::Value;
 pub use turso_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
@@ -272,9 +291,11 @@ pub(crate) unsafe extern "C" fn rtree_geometry_callback(
     // before calling any SQL function). We store the raw (geom_fn, user_context) in
     // the registry; a dispatch shim retrieves them and calls geom_fn.
     let mut registry = SCALAR_WITH_CTX_REGISTRY.write().unwrap();
-    let conn_ptr = (CURRENT_CONN_CTX
-        .with(|ctx| ctx.borrow().as_ref().map(|c| Arc::as_ptr(c) as usize)))
-    .unwrap_or(0usize);
+    let conn_opt = CURRENT_CONN_CTX.with(|ctx| ctx.take());
+    let conn_ptr = conn_opt
+        .as_ref()
+        .map(|c| Arc::as_ptr(c) as usize)
+        .unwrap_or(0usize);
 
     if conn_ptr == 0 {
         return ResultCode::Error;
@@ -306,11 +327,20 @@ pub(crate) unsafe extern "C" fn rtree_geometry_callback(
         let args = std::slice::from_raw_parts(argv, argc as usize);
 
         // Look up (geom_fn, user_context) from CURRENT_CONN_CTX's registry.
-        let (geom_fn, user_context) = match CURRENT_CONN_CTX.with(|ctx| ctx.borrow().clone()) {
+        // The name comes from CURRENT_GEOM_NAME thread-local (set by rtree_geometry_callback).
+        // Use take since Cell has no borrow(). This is safe because
+        // geom_shim runs synchronously during VDBE execution — the name
+        // is set before the call and cleared after, so no concurrent access.
+        let name = match take_current_geom_name() {
+            Some(n) => n,
+            None => return ExtValue::null(),
+        };
+        let conn_opt = CURRENT_CONN_CTX.with(|ctx| ctx.take());
+        let (geom_fn, user_context) = match conn_opt {
             Some(conn) => {
                 let conn_ptr = Arc::as_ptr(&conn) as *const _ as usize;
                 let registry = SCALAR_WITH_CTX_REGISTRY.read().unwrap();
-                match registry.get(&conn_ptr).and_then(|m| m.get("")) {
+                match registry.get(&conn_ptr).and_then(|m| m.get(&name)) {
                     Some(swctx) => {
                         let geom_fn_ptr = swctx.packed >> 16;
                         let geom_fn: GeometryCallbackFn =
@@ -354,6 +384,8 @@ pub(crate) unsafe extern "C" fn rtree_geometry_callback(
     }
 
     // Insert the shim as a regular scalar function with ctx.
+    // The name is stored in CURRENT_GEOM_NAME thread-local by rtree_geometry_callback,
+    // and geom_shim reads it via take_current_geom_name().
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
     unsafe {
         (*ext_ctx.syms).functions.insert(
@@ -523,7 +555,7 @@ impl Database {
         #[cfg(feature = "rtree")]
         {
             // SAFETY: limbo_rtree has no global state and is safe to register
-            unsafe { crate::limbo_rtree::register_extension(&mut ext_api) };
+            unsafe { crate::limbo_rtree::register_extension_static(&mut ext_api) };
         }
         #[cfg(feature = "fs")]
         {

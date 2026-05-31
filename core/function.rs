@@ -90,6 +90,7 @@ pub enum ExtFunc {
     /// The connection is stored in a thread-local and forwarded to the callback as the
     /// second argument (after `context`).
     ScalarWithCtx {
+        name: Option<String>,
         context: usize,
         argc: i32,
         deterministic: bool,
@@ -214,7 +215,7 @@ impl ExternalFunc {
     /// The connection context is stored in a thread-local `Cell` and read by the C shim
     /// that wraps the callback before dispatching into Rust.
     pub fn new_scalar_with_ctx(
-        name: String,
+        func_name: String,
         argc: i32,
         deterministic: bool,
         context: usize,
@@ -230,8 +231,9 @@ impl ExternalFunc {
         value_destructor: Option<ValueDestructor>,
     ) -> Self {
         Self {
-            name,
+            name: func_name.clone(),
             func: ExtFunc::ScalarWithCtx {
+                name: Some(func_name),
                 context,
                 argc,
                 deterministic,

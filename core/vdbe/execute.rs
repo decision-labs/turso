@@ -8740,7 +8740,6 @@ pub fn op_function(
                 // Set CURRENT_CONN_CTX so the geom_shim can look up the registered geom_fn.
                 let conn = state.connection.as_ref().unwrap().clone();
                 crate::ext::set_current_conn_ctx(conn.clone());
-                let conn_ctx = crate::ext::get_current_conn_ctx();
                 let mut ext_values = Vec::with_capacity(arg_count);
                 if arg_count != 0 {
                     let register_slice = &state.registers[*start_reg..*start_reg + arg_count];

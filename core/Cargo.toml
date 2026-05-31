@@ -129,7 +129,7 @@ tantivy = { version = "0.26.0", optional = true }
 [target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
 simsimd = "6.5.3"
 
-limbo_rtree = { path = "../extensions/rtree", optional = true }
+limbo_rtree = { path = "../extensions/rtree", optional = true, features = ["static"] }
 
 [target.'cfg(antithesis)'.dependencies]
 antithesis_sdk = { workspace = true, features = ["full"] }
