@@ -40,9 +40,9 @@
 
 use std::sync::Arc;
 use turso_ext::{
-    register_extension, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo,
-    OrderByInfo, ResultCode, StepResult, VTabCursor, VTabKind, VTabModule, VTabModuleDerive,
-    VTable, Value, ValueType,
+    Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
+    StepResult, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value, ValueType,
+    register_extension,
 };
 
 register_extension! {
@@ -246,7 +246,7 @@ unsafe extern "C" fn geom_callback_sql(
     let n_param = params.len();
     let mut result_blob = Vec::with_capacity(4 + 8 + 8 + 8 + n_param * 8);
     result_blob.extend_from_slice(&(u32::MAX as usize).to_le_bytes()); // iSize (placeholder)
-                                                                       // Store pointer to the Arc<RtreeGeomCallback> as x_geom "pointer"
+    // Store pointer to the Arc<RtreeGeomCallback> as x_geom "pointer"
     let geom_ptr = Arc::into_raw(callback.clone()) as usize;
     result_blob.extend_from_slice(&geom_ptr.to_le_bytes());
     // context ptr = conn_ptr (unused for lookup, already encoded in registry)
@@ -266,7 +266,7 @@ unsafe extern "C" fn geom_callback_sql(
 
 /// Register the built-in `circle` geometry callback on a connection.
 /// This provides a pre-built MATCH function so users don't need to register one.
-fn register_builtin_circle_callback(conn: &Arc<turso_ext::Connection>) {
+pub fn register_builtin_circle_callback(conn: &Arc<turso_ext::Connection>) {
     register_geom_callback(
         conn,
         "circle",
@@ -897,11 +897,7 @@ impl RtreeTable {
                     leaf.set_depth(leaf.tree_depth() + 1);
                 }
                 self.write_node(conn, nodeno, &leaf)?;
-                if new_in_right {
-                    right_no
-                } else {
-                    left_no
-                }
+                if new_in_right { right_no } else { left_no }
             }
         } else {
             self.node_count += 1;
