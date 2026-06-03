@@ -22,7 +22,6 @@
 //!   right bbox, which may overflow the parent) is not implemented.
 //! - Root collapse (`rtreeDeleteRowid` ~2978 in `ext/rtree/rtree.c`) queues cells at height `iDepth-1`;
 //!   `descend_from_root_with_start` uses `ChooseLeaf` descent counts (`iDepth - iHeight`).
-//! - On-conflict clauses (`INSERT OR REPLACE`/`OR IGNORE`) are not honored; a duplicate rowid always errors.
 //!
 //! ## Split algorithm
 //!
