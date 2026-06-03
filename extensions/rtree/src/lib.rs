@@ -2483,9 +2483,8 @@ impl VTabCursor for RtreeCursor {
         }
 
         let idx_bytes = idx_str.as_bytes();
-        let mut arg_idx = 0;
 
-        for pair_idx in (0..idx_bytes.len()).step_by(2) {
+        for (arg_idx, pair_idx) in (0..idx_bytes.len()).step_by(2).enumerate() {
             if pair_idx + 1 >= idx_bytes.len() {
                 break;
             }
@@ -2515,7 +2514,6 @@ impl VTabCursor for RtreeCursor {
                     });
                 }
             }
-            arg_idx += 1;
         }
 
         // Unconstrained scan reuses the same walk: with `constraints` empty, the per-constraint loop is a no-op so
