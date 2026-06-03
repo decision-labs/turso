@@ -480,6 +480,15 @@ struct RtreeTable {
     coord_type: u8,
 }
 
+/// Running cell counts accumulated by [`RtreeTable::check_node_recursive`] during an integrity walk.
+/// Used to verify `%_rowid` / `%_parent` shadow-table row counts against the actual number of cells
+/// seen at each level. Bundled into a struct so the recursive helper takes one parameter instead of two.
+#[derive(Default)]
+struct CheckCounts {
+    leaf: i64,
+    nonleaf: i64,
+}
+
 impl RtreeTable {
     fn max_cells(&self) -> usize {
         (self.node_size - 4) / self.n_bytes_per_cell
@@ -1258,8 +1267,7 @@ impl RtreeTable {
     #[allow(dead_code)]
     pub fn integrity_check(&self, conn: &Arc<Connection>) -> Result<Vec<String>, ResultCode> {
         let mut report: Vec<String> = Vec::new();
-        let mut n_leaf: i64 = 0;
-        let mut n_nonleaf: i64 = 0;
+        let mut counts = CheckCounts::default();
 
         let root = match self.read_node(conn, 1)? {
             Some(node) => node,
@@ -1269,29 +1277,23 @@ impl RtreeTable {
             }
         };
         let root_depth = root.tree_depth();
-        self.check_node_recursive(
-            conn,
-            &root,
-            root_depth,
-            None,
-            &mut report,
-            &mut n_leaf,
-            &mut n_nonleaf,
-        )?;
+        self.check_node_recursive(conn, &root, root_depth, None, &mut report, &mut counts)?;
 
         if report.len() < RTREE_CHECK_MAX_ERRORS {
             let actual_rowids = self.shadow_table_row_count(conn, &self.shadow_rowid_table())?;
-            if actual_rowids != n_leaf {
+            if actual_rowids != counts.leaf {
                 report.push(format!(
-                    "Wrong number of entries in %_rowid table - expected {n_leaf}, actual {actual_rowids}"
+                    "Wrong number of entries in %_rowid table - expected {}, actual {actual_rowids}",
+                    counts.leaf
                 ));
             }
         }
         if report.len() < RTREE_CHECK_MAX_ERRORS {
             let actual_parents = self.shadow_table_row_count(conn, &self.shadow_parent_table())?;
-            if actual_parents != n_nonleaf {
+            if actual_parents != counts.nonleaf {
                 report.push(format!(
-                    "Wrong number of entries in %_parent table - expected {n_nonleaf}, actual {actual_parents}"
+                    "Wrong number of entries in %_parent table - expected {}, actual {actual_parents}",
+                    counts.nonleaf
                 ));
             }
         }
@@ -1346,8 +1348,7 @@ impl RtreeTable {
         depth: usize,
         parent_bbox: Option<&RtreeCell>,
         report: &mut Vec<String>,
-        n_leaf: &mut i64,
-        n_nonleaf: &mut i64,
+        counts: &mut CheckCounts,
     ) -> Result<(), ResultCode> {
         if report.len() >= RTREE_CHECK_MAX_ERRORS {
             return Ok(());
@@ -1364,7 +1365,7 @@ impl RtreeTable {
             }
 
             if is_leaf {
-                *n_leaf += 1;
+                counts.leaf += 1;
                 // Check 3: %_rowid maps cell.rowid -> node.node_no.
                 match self.get_rowid_nodeno(conn, cell.rowid)? {
                     None => {
@@ -1382,7 +1383,7 @@ impl RtreeTable {
                     Some(_) => {}
                 }
             } else {
-                *n_nonleaf += 1;
+                counts.nonleaf += 1;
                 // Check 4: %_parent maps child_nodeno -> node.node_no.
                 let child_no = cell.rowid;
                 match self.get_parent_nodeno(conn, child_no)? {
@@ -1409,8 +1410,7 @@ impl RtreeTable {
                         next_depth,
                         Some(&cell),
                         report,
-                        n_leaf,
-                        n_nonleaf,
+                        counts,
                     )?;
                 } else if report.len() < RTREE_CHECK_MAX_ERRORS {
                     report.push(format!("Node {child_no} missing from database"));
