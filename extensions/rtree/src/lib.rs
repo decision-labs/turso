@@ -15,8 +15,8 @@
 //!
 //! ## Gaps
 //!
-//! - `MATCH` / `sqlite3_rtree_geometry_callback`-style geometry callbacks are not implemented.
-//! - Row-count estimates from `sqlite_stat1` in `best_index` are not wired (static `best_index` has no table handle).
+//! - `sqlite_stat1` row estimates in `best_index` (static `best_index` has no table handle, so per-table
+//!   stats can't be consulted; estimates are coarse).
 //! - Internal full nodes use the same **promote-to-internal** split as leaf insert (two new siblings under the
 //!   split nodeno). The alternate `SplitNode` path (`pLeft = pNode`, then `rtreeInsertCell` into the parent for the
 //!   right bbox, which may overflow the parent) is not implemented.
@@ -40,9 +40,9 @@
 
 use std::sync::Arc;
 use turso_ext::{
-    Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
-    StepResult, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value, ValueType,
-    register_extension,
+    register_extension, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo,
+    OrderByInfo, ResultCode, StepResult, VTabCursor, VTabKind, VTabModule, VTabModuleDerive,
+    VTable, Value, ValueType,
 };
 
 register_extension! {
@@ -55,6 +55,11 @@ const RTREE_MAX_AUX_COLUMN: usize = 100;
 const RTREE_DEFAULT_ROWEST: i64 = 1048576;
 /// Floor when estimating rows in `best_index`; see `RTREE_MIN_ROWEST` in `ext/rtree/rtree.c`.
 const RTREE_MIN_ROWEST: u32 = 100;
+
+/// See `RTREE_COORD_REAL32` in `ext/rtree/rtree.c` — 32-bit float coordinates.
+const RTREE_COORD_REAL32: u8 = 0;
+/// See `RTREE_COORD_INT32` in `ext/rtree/rtree.c` — 32-bit integer coordinates.
+const RTREE_COORD_INT32: u8 = 1;
 
 const RTREE_EQ: u8 = b'A';
 const RTREE_LE: u8 = b'B';
@@ -113,16 +118,9 @@ pub struct RtreeGeomCallback {
 
 /// Per-connection registry of named MATCH geometry callbacks.
 /// Populated by `sqlite3_rtree_geometry_callback()` and consulted during `filter()`.
+#[derive(Default)]
 struct RtreeGeomRegistry {
     callbacks: HashMap<String, Arc<RtreeGeomCallback>>,
-}
-
-impl Default for RtreeGeomRegistry {
-    fn default() -> Self {
-        Self {
-            callbacks: HashMap::new(),
-        }
-    }
 }
 
 /// Global registry keyed by opaque connection pointer derived from Arc identity.
@@ -246,7 +244,7 @@ unsafe extern "C" fn geom_callback_sql(
     let n_param = params.len();
     let mut result_blob = Vec::with_capacity(4 + 8 + 8 + 8 + n_param * 8);
     result_blob.extend_from_slice(&(u32::MAX as usize).to_le_bytes()); // iSize (placeholder)
-    // Store pointer to the Arc<RtreeGeomCallback> as x_geom "pointer"
+                                                                       // Store pointer to the Arc<RtreeGeomCallback> as x_geom "pointer"
     let geom_ptr = Arc::into_raw(callback.clone()) as usize;
     result_blob.extend_from_slice(&geom_ptr.to_le_bytes());
     // context ptr = conn_ptr (unused for lookup, already encoded in registry)
@@ -277,9 +275,9 @@ pub fn register_builtin_circle_callback(conn: &Arc<turso_ext::Connection>) {
                 *result = 0;
                 return false;
             }
-            let x0 = params[0] as f64;
-            let y0 = params[1] as f64;
-            let r = params[2] as f64;
+            let x0 = params[0];
+            let y0 = params[1];
+            let r = params[2];
 
             let cx = ((coords[0] + coords[1]) / 2.0) as f64;
             let cy = ((coords[2] + coords[3]) / 2.0) as f64;
@@ -376,16 +374,15 @@ impl RtreeModule {
         }
         Ok((coord_names, aux_names))
     }
-}
 
-impl VTabModule for RtreeModule {
-    type Table = RtreeTable;
-    const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
-    const NAME: &'static str = "rtree";
-    const READONLY: bool = false;
-
-    fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
-        // args[0..3] is [module, db, table]; args[3] is the rowid column name; args[4..] is coord cols + aux cols.
+    /// Shared CREATE-VIRTUAL-TABLE logic for the `rtree` and `rtree_i32` modules. The only thing that varies
+    /// between the two modules is the coord_type (REAL32 vs INT32) and the column-affinity string
+    /// (`REAL` vs `INTEGER` in the schema).
+    fn create_with(
+        args: &[Value],
+        module_name: &'static str,
+        coord_type: u8,
+    ) -> Result<(String, RtreeTable), ResultCode> {
         if args.len() < 5 {
             return Err(ResultCode::InvalidArgs);
         }
@@ -406,11 +403,17 @@ impl VTabModule for RtreeModule {
         let n_bytes_per_cell: usize = 8 + n_dim2 * 4;
         let default_node_size: usize = 4096 - 64;
 
+        let coord_affinity = if coord_type == RTREE_COORD_INT32 {
+            "INTEGER"
+        } else {
+            "REAL"
+        };
         let mut columns = format!("{} INTEGER PRIMARY KEY", quote_sql_ident(&rowid_col_name));
         for name in &coord_names {
             columns.push_str(", ");
             columns.push_str(&quote_sql_ident(name));
-            columns.push_str(" REAL");
+            columns.push(' ');
+            columns.push_str(coord_affinity);
         }
         for name in &aux_columns {
             columns.push_str(&format!(", {} TEXT", quote_sql_ident(name)));
@@ -422,9 +425,6 @@ impl VTabModule for RtreeModule {
             .and_then(|v| v.to_text())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "x".to_string());
-
-        // Detect rtree_i32 variant from module name (passed as first arg).
-        let coord_type = if Self::NAME == "rtree_i32" { 1 } else { 0 };
 
         let table = RtreeTable {
             n_dim2,
@@ -438,7 +438,20 @@ impl VTabModule for RtreeModule {
             coord_type,
         };
 
+        // module_name kept for parity with SQLite's rtreeSqlInit / rtreeInit parameter validation; not used here.
+        let _ = module_name;
         Ok((schema, table))
+    }
+}
+
+impl VTabModule for RtreeModule {
+    type Table = RtreeTable;
+    const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+    const NAME: &'static str = "rtree";
+    const READONLY: bool = false;
+
+    fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        RtreeModule::create_with(args, Self::NAME, RTREE_COORD_REAL32)
     }
 }
 
@@ -449,51 +462,7 @@ impl VTabModule for RtreeModuleI32 {
     const READONLY: bool = false;
 
     fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
-        // Reuse RtreeModule's create logic; only the NAME differs (detected in create above).
-        // We need to forward to RtreeModule::create but since they're separate impl blocks,
-        // duplicate the logic with coord_type = 1 (INT32).
-        let rowid_col_name = args
-            .get(3)
-            .and_then(|v| v.to_text())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "rowid".to_string());
-
-        let (coord_names, aux_columns) = RtreeModule::parse_column_args(&args[4..])?;
-        let n_dim2 = coord_names.len();
-        let n_bytes_per_cell: usize = 8 + n_dim2 * 4;
-        let default_node_size: usize = 4096 - 64;
-
-        let mut columns = format!("{} INTEGER PRIMARY KEY", quote_sql_ident(&rowid_col_name));
-        for name in &coord_names {
-            columns.push_str(", ");
-            columns.push_str(&quote_sql_ident(name));
-            // rtree_i32 uses INTEGER for coordinate columns (stored as f32 in cell)
-            columns.push_str(" INTEGER");
-        }
-        for name in &aux_columns {
-            columns.push_str(&format!(", {} TEXT", quote_sql_ident(name)));
-        }
-        let schema = format!("CREATE TABLE x ({})", columns);
-
-        let table_name = args
-            .get(2)
-            .and_then(|v| v.to_text())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "x".to_string());
-
-        let table = RtreeTable {
-            n_dim2,
-            n_bytes_per_cell,
-            node_size: default_node_size,
-            depth: 0,
-            row_count: 0,
-            node_count: 0,
-            table_name,
-            aux_columns,
-            coord_type: 1, // INT32
-        };
-
-        Ok((schema, table))
+        RtreeModule::create_with(args, Self::NAME, RTREE_COORD_INT32)
     }
 }
 
@@ -842,7 +811,7 @@ impl RtreeTable {
                 return Err(ResultCode::Corrupt);
             }
             let mut out = Vec::with_capacity(self.aux_columns.len());
-            for i in 0..self.aux_columns.len() {
+            for (i, _) in self.aux_columns.iter().enumerate() {
                 out.push(value_to_owned(&row[i]));
             }
             return Ok(out);
@@ -897,7 +866,11 @@ impl RtreeTable {
                     leaf.set_depth(leaf.tree_depth() + 1);
                 }
                 self.write_node(conn, nodeno, &leaf)?;
-                if new_in_right { right_no } else { left_no }
+                if new_in_right {
+                    right_no
+                } else {
+                    left_no
+                }
             }
         } else {
             self.node_count += 1;
@@ -1567,8 +1540,11 @@ impl RtreeNode {
     ) -> [f32; RTREE_MAX_DIMENSIONS * 2] {
         let offset = 4 + n_bytes_per_cell * i_cell + 8;
         let mut coords = [0.0; RTREE_MAX_DIMENSIONS * 2];
-        for i in 0..n_dim2 {
-            coords[i] = self.read_coord(offset + i * 4);
+        for (i, slot) in coords.iter_mut().enumerate() {
+            if i >= n_dim2 {
+                break;
+            }
+            *slot = self.read_coord(offset + i * 4);
         }
         coords
     }
@@ -2267,7 +2243,7 @@ impl VTable for RtreeTable {
         // Build the cell and enforce coord1 <= coord2 per dimension (`rtreeConstraintError` in rtree.c).
         let mut cell = RtreeCell::new(rowid);
         for i in 0..self.n_dim2 {
-            if self.coord_type == 1 {
+            if self.coord_type == RTREE_COORD_INT32 {
                 // INT32: read as integer and convert to f32
                 if let Some(val) = args[i + 1].to_integer() {
                     cell.coords[i] = val as f32;
@@ -2545,83 +2521,81 @@ impl VTabCursor for RtreeCursor {
 
         // Unconstrained scan reuses the same walk: with `constraints` empty, the per-constraint loop is a no-op so
         // every cell passes the leaf check.
-        if let Some(_conn) = &self.conn {
-            if let Some(root) = self.load_node(1) {
-                let depth = root.tree_depth();
-                let mut current_node = root;
-                let current_level = if depth == 0 { 0 } else { depth as i32 };
-                let mut current_cell_idx = 0usize;
-                let mut level = current_level;
+        if let Some(root) = self.load_node(1) {
+            let depth = root.tree_depth();
+            let mut current_node = root;
+            let current_level = if depth == 0 { 0 } else { depth as i32 };
+            let mut current_cell_idx = 0usize;
+            let mut level = current_level;
 
-                loop {
-                    if level <= 0 {
-                        let n_cells = current_node.cell_count();
-                        while current_cell_idx < n_cells {
-                            let cell = current_node.get_cell(
-                                self.n_dim2,
-                                self.n_bytes_per_cell,
-                                current_cell_idx,
-                            );
+            loop {
+                if level <= 0 {
+                    let n_cells = current_node.cell_count();
+                    while current_cell_idx < n_cells {
+                        let cell = current_node.get_cell(
+                            self.n_dim2,
+                            self.n_bytes_per_cell,
+                            current_cell_idx,
+                        );
 
-                            let mut matches = true;
-                            for constraint in &self.constraints {
-                                let result = leaf_constraint(constraint, &cell, self.n_dim2);
-                                if result == NOT_WITHIN {
-                                    matches = false;
-                                    break;
-                                }
+                        let mut matches = true;
+                        for constraint in &self.constraints {
+                            let result = leaf_constraint(constraint, &cell, self.n_dim2);
+                            if result == NOT_WITHIN {
+                                matches = false;
+                                break;
                             }
-
-                            if matches {
-                                self.rowid = cell.rowid;
-                                self.current_coords[..self.n_dim2 * 2]
-                                    .copy_from_slice(&cell.coords[..self.n_dim2 * 2]);
-                                self.at_eof = false;
-                                if self.load_aux_values() != Ok(()) {
-                                    return ResultCode::Error;
-                                }
-                                return ResultCode::OK;
-                            }
-
-                            current_cell_idx += 1;
                         }
+
+                        if matches {
+                            self.rowid = cell.rowid;
+                            self.current_coords[..self.n_dim2 * 2]
+                                .copy_from_slice(&cell.coords[..self.n_dim2 * 2]);
+                            self.at_eof = false;
+                            if self.load_aux_values() != Ok(()) {
+                                return ResultCode::Error;
+                            }
+                            return ResultCode::OK;
+                        }
+
+                        current_cell_idx += 1;
+                    }
+                    break;
+                } else {
+                    let n_cells = current_node.cell_count();
+                    let mut found_child = false;
+
+                    while current_cell_idx < n_cells {
+                        let cell = current_node.get_cell(
+                            self.n_dim2,
+                            self.n_bytes_per_cell,
+                            current_cell_idx,
+                        );
+
+                        let mut matches = true;
+                        for constraint in &self.constraints {
+                            let result = nonleaf_constraint(constraint, &cell, self.n_dim2);
+                            if result == NOT_WITHIN {
+                                matches = false;
+                                break;
+                            }
+                        }
+
+                        if matches {
+                            if let Some(child_node) = self.load_node(cell.rowid) {
+                                current_node = child_node;
+                                level -= 1;
+                                current_cell_idx = 0;
+                                found_child = true;
+                                break;
+                            }
+                        }
+
+                        current_cell_idx += 1;
+                    }
+
+                    if !found_child {
                         break;
-                    } else {
-                        let n_cells = current_node.cell_count();
-                        let mut found_child = false;
-
-                        while current_cell_idx < n_cells {
-                            let cell = current_node.get_cell(
-                                self.n_dim2,
-                                self.n_bytes_per_cell,
-                                current_cell_idx,
-                            );
-
-                            let mut matches = true;
-                            for constraint in &self.constraints {
-                                let result = nonleaf_constraint(constraint, &cell, self.n_dim2);
-                                if result == NOT_WITHIN {
-                                    matches = false;
-                                    break;
-                                }
-                            }
-
-                            if matches {
-                                if let Some(child_node) = self.load_node(cell.rowid) {
-                                    current_node = child_node;
-                                    level -= 1;
-                                    current_cell_idx = 0;
-                                    found_child = true;
-                                    break;
-                                }
-                            }
-
-                            current_cell_idx += 1;
-                        }
-
-                        if !found_child {
-                            break;
-                        }
                     }
                 }
             }
@@ -2662,89 +2636,87 @@ impl VTabCursor for RtreeCursor {
 
         let saved_rowid = self.rowid;
 
-        if let Some(_conn) = &self.conn {
-            if let Some(root) = self.load_node(1) {
-                let depth = root.tree_depth();
-                let mut current_node = root;
-                let current_level = if depth == 0 { 0 } else { depth as i32 };
-                let mut current_cell_idx = 0usize;
-                let mut level = current_level;
+        if let Some(root) = self.load_node(1) {
+            let depth = root.tree_depth();
+            let mut current_node = root;
+            let current_level = if depth == 0 { 0 } else { depth as i32 };
+            let mut current_cell_idx = 0usize;
+            let mut level = current_level;
 
-                loop {
-                    if level <= 0 {
-                        let n_cells = current_node.cell_count();
+            loop {
+                if level <= 0 {
+                    let n_cells = current_node.cell_count();
 
-                        while current_cell_idx < n_cells {
-                            let cell = current_node.get_cell(
-                                self.n_dim2,
-                                self.n_bytes_per_cell,
-                                current_cell_idx,
-                            );
+                    while current_cell_idx < n_cells {
+                        let cell = current_node.get_cell(
+                            self.n_dim2,
+                            self.n_bytes_per_cell,
+                            current_cell_idx,
+                        );
 
-                            if cell.rowid <= saved_rowid {
-                                current_cell_idx += 1;
-                                continue;
-                            }
-
-                            let mut matches = true;
-                            for constraint in &self.constraints {
-                                let result = leaf_constraint(constraint, &cell, self.n_dim2);
-                                if result == NOT_WITHIN {
-                                    matches = false;
-                                    break;
-                                }
-                            }
-
-                            if matches {
-                                self.rowid = cell.rowid;
-                                self.current_coords[..self.n_dim2 * 2]
-                                    .copy_from_slice(&cell.coords[..self.n_dim2 * 2]);
-                                self.at_eof = false;
-                                if self.load_aux_values() != Ok(()) {
-                                    return ResultCode::Error;
-                                }
-                                return ResultCode::OK;
-                            }
-
+                        if cell.rowid <= saved_rowid {
                             current_cell_idx += 1;
+                            continue;
                         }
+
+                        let mut matches = true;
+                        for constraint in &self.constraints {
+                            let result = leaf_constraint(constraint, &cell, self.n_dim2);
+                            if result == NOT_WITHIN {
+                                matches = false;
+                                break;
+                            }
+                        }
+
+                        if matches {
+                            self.rowid = cell.rowid;
+                            self.current_coords[..self.n_dim2 * 2]
+                                .copy_from_slice(&cell.coords[..self.n_dim2 * 2]);
+                            self.at_eof = false;
+                            if self.load_aux_values() != Ok(()) {
+                                return ResultCode::Error;
+                            }
+                            return ResultCode::OK;
+                        }
+
+                        current_cell_idx += 1;
+                    }
+                    break;
+                } else {
+                    let n_cells = current_node.cell_count();
+                    let mut found_child = false;
+
+                    while current_cell_idx < n_cells {
+                        let cell = current_node.get_cell(
+                            self.n_dim2,
+                            self.n_bytes_per_cell,
+                            current_cell_idx,
+                        );
+
+                        let mut matches = true;
+                        for constraint in &self.constraints {
+                            let result = nonleaf_constraint(constraint, &cell, self.n_dim2);
+                            if result == NOT_WITHIN {
+                                matches = false;
+                                break;
+                            }
+                        }
+
+                        if matches {
+                            if let Some(child_node) = self.load_node(cell.rowid) {
+                                current_node = child_node;
+                                level -= 1;
+                                current_cell_idx = 0;
+                                found_child = true;
+                                break;
+                            }
+                        }
+
+                        current_cell_idx += 1;
+                    }
+
+                    if !found_child {
                         break;
-                    } else {
-                        let n_cells = current_node.cell_count();
-                        let mut found_child = false;
-
-                        while current_cell_idx < n_cells {
-                            let cell = current_node.get_cell(
-                                self.n_dim2,
-                                self.n_bytes_per_cell,
-                                current_cell_idx,
-                            );
-
-                            let mut matches = true;
-                            for constraint in &self.constraints {
-                                let result = nonleaf_constraint(constraint, &cell, self.n_dim2);
-                                if result == NOT_WITHIN {
-                                    matches = false;
-                                    break;
-                                }
-                            }
-
-                            if matches {
-                                if let Some(child_node) = self.load_node(cell.rowid) {
-                                    current_node = child_node;
-                                    level -= 1;
-                                    current_cell_idx = 0;
-                                    found_child = true;
-                                    break;
-                                }
-                            }
-
-                            current_cell_idx += 1;
-                        }
-
-                        if !found_child {
-                            break;
-                        }
                     }
                 }
             }
