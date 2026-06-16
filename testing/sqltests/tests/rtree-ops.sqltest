@@ -1,0 +1,72 @@
+@database :memory:
+
+# Ported from ext/rtree/rtree1.test rtree-3.*: linear scans of r-tree data.
+# This exercises xFilter with no usable constraints (full table scan via
+# the root-node walker).
+
+setup rtree-linear {
+    CREATE VIRTUAL TABLE t1 USING rtree(ii, x1, x2, y1, y2);
+}
+
+@setup rtree-linear
+test linear-scan-empty {
+    SELECT * FROM t1 ORDER BY ii;
+}
+expect {
+}
+
+@setup rtree-linear
+test linear-scan-one-row {
+    INSERT INTO t1 VALUES(5, 1, 3, 2, 4);
+    SELECT * FROM t1 ORDER BY ii;
+}
+expect {
+    5|1.0|3.0|2.0|4.0
+}
+
+@setup rtree-linear
+test linear-scan-two-rows {
+    INSERT INTO t1 VALUES(5, 1, 3, 2, 4);
+    INSERT INTO t1 VALUES(6, 2, 6, 4, 8);
+    SELECT * FROM t1 ORDER BY ii;
+}
+expect {
+    5|1.0|3.0|2.0|4.0
+    6|2.0|6.0|4.0|8.0
+}
+
+# Constraint on the coordinates: c[i]<=c[i+1] where (i%2==0).
+@setup rtree-linear
+test linear-scan-coord-constraint-violation {
+    INSERT INTO t1 VALUES(7, 2, 6, 4, 3);
+}
+expect error {
+}
+
+# y1 == y2 is allowed (zero-height is valid).
+@setup rtree-linear
+test linear-scan-coord-equal-allowed {
+    INSERT INTO t1 VALUES(8, 2, 6, 3, 3);
+    SELECT * FROM t1 WHERE ii = 8;
+}
+expect {
+    8|2.0|6.0|3.0|3.0
+}
+
+# UPDATE on a coord column: should re-insert the cell with the new value.
+# This works because UPDATE on a virtual table goes through xUpdate which
+# calls delete + insert.
+
+setup rtree-update {
+    CREATE VIRTUAL TABLE t3 USING rtree(ii, x1, x2, y1, y2);
+    INSERT INTO t3 VALUES(1, 2, 3, 4, 5);
+}
+
+@setup rtree-update
+test update-coord-x2 {
+    UPDATE t3 SET x2=5;
+    SELECT * FROM t3;
+}
+expect {
+    1|2.0|5.0|4.0|5.0
+}
