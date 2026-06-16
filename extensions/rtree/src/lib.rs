@@ -2345,6 +2345,16 @@ impl VTable for RtreeTable {
         Ok(())
     }
 
+    fn rename(&mut self, new_name: &str) -> Result<(), Self::Error> {
+        // SQLite's xRename: the engine has already renamed the rtree virtual table entry in the schema;
+        // update our cached `table_name` so subsequent `shadow_*_table()` calls match. The actual
+        // shadow-table rename happens in `core::VirtualTable::rename` (which has DB access); this hook
+        // exists so the in-memory struct stays in sync. See `rtreeRename` in ext/rtree/rtree.c for the
+        // equivalent C code path.
+        self.table_name = new_name.to_string();
+        Ok(())
+    }
+
     fn best_index(
         constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
