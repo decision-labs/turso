@@ -3241,4 +3241,22 @@ mod tests {
             Err(ResultCode::InvalidArgs)
         );
     }
+
+    #[test]
+    fn test_rename_updates_table_name() {
+        let mut table = new_table(vec![
+            "rtree", "main", "old_name", "id", "xmin", "xmax", "ymin", "ymax",
+        ]);
+        assert_eq!(table.table_name, "old_name");
+        assert_eq!(table.shadow_node_table(), "old_name_node");
+        assert_eq!(table.shadow_rowid_table(), "old_name_rowid");
+        assert_eq!(table.shadow_parent_table(), "old_name_parent");
+
+        VTable::rename(&mut table, "new_name").unwrap();
+        assert_eq!(table.table_name, "new_name");
+        // shadow_*_table() reads `table_name` at call time, so they must follow the rename.
+        assert_eq!(table.shadow_node_table(), "new_name_node");
+        assert_eq!(table.shadow_rowid_table(), "new_name_rowid");
+        assert_eq!(table.shadow_parent_table(), "new_name_parent");
+    }
 }
