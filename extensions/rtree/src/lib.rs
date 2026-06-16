@@ -39,13 +39,14 @@
 
 use std::sync::Arc;
 use turso_ext::{
-    register_extension, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo,
-    OrderByInfo, ResultCode, StepResult, VTabCursor, VTabKind, VTabModule, VTabModuleDerive,
-    VTable, Value, ValueType,
+    register_extension, scalar, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage,
+    IndexInfo, OrderByInfo, ResultCode, StepResult, VTabCursor, VTabKind, VTabModule,
+    VTabModuleDerive, VTable, Value, ValueType,
 };
 
 register_extension! {
-    vtabs: { RtreeModule, RtreeModuleI32 }
+    vtabs: { RtreeModule, RtreeModuleI32 },
+    scalars: { rtreedepth, rtreenode },
 }
 
 const RTREE_MAX_DIMENSIONS: usize = 5;
@@ -77,6 +78,102 @@ const IDX_NUM_QUERY: i32 = 2;
 
 const IDX_STR_ROWID: &str = "rowid_lookup";
 const IDX_STR_QUERY: &str = "query";
+
+/// `rtreedepth(blob)` — SQL scalar function that returns the depth value stored in the
+/// first 2 bytes (big-endian u16) of an r-tree node blob. Matches `rtreedepth` in
+/// `ext/rtree/rtree.c` ~3818. Errors on non-blob or short-blob input.
+#[scalar(name = "rtreedepth")]
+fn rtreedepth(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::error_with_message(format!(
+            "rtreedepth() expects 1 argument, got {}",
+            args.len()
+        ));
+    }
+    compute_rtreedepth(&args[0])
+}
+
+fn compute_rtreedepth(arg: &Value) -> Value {
+    let blob = match arg.blob_ref() {
+        Some(b) => b,
+        None => {
+            return Value::error_with_message("Invalid argument to rtreedepth()".to_string());
+        }
+    };
+    if blob.len() < 2 {
+        return Value::error_with_message("Invalid argument to rtreedepth()".to_string());
+    }
+    let depth = u16::from_be_bytes([blob[0], blob[1]]);
+    Value::from_integer(depth as i64)
+}
+
+/// `rtreenode(nDim, blob)` — SQL scalar function that returns a Tcl-list-style text
+/// representation of an r-tree node blob. Matches `rtreenode` in `ext/rtree/rtree.c` ~3766.
+/// `nDim` must be 1..=5; `blob` is the node data. Each cell renders as
+/// `{rowid c0 c1 ... c{2*nDim-1}}`.
+#[scalar(name = "rtreenode")]
+fn rtreenode(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::error_with_message(format!(
+            "rtreenode() expects 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    compute_rtreenode(&args[0], &args[1])
+}
+
+fn compute_rtreenode(n_dim_arg: &Value, blob_arg: &Value) -> Value {
+    let n_dim = match n_dim_arg.to_integer() {
+        Some(n) if (1..=RTREE_MAX_DIMENSIONS as i64).contains(&n) => n as usize,
+        _ => return Value::null(),
+    };
+    let n_dim2 = n_dim * 2;
+    let n_bytes_per_cell = 8 + n_dim2 * 4;
+    let blob = match blob_arg.blob_ref() {
+        Some(b) => b,
+        None => return Value::null(),
+    };
+    if blob.len() < 4 {
+        return Value::null();
+    }
+    let n_cells = u16::from_be_bytes([blob[2], blob[3]]) as usize;
+    if blob.len() < 4 + n_cells * n_bytes_per_cell {
+        return Value::null();
+    }
+    let mut out = String::new();
+    for i in 0..n_cells {
+        if i > 0 {
+            out.push(' ');
+        }
+        let offset = 4 + i * n_bytes_per_cell;
+        let rowid = i64::from_le_bytes([
+            blob[offset],
+            blob[offset + 1],
+            blob[offset + 2],
+            blob[offset + 3],
+            blob[offset + 4],
+            blob[offset + 5],
+            blob[offset + 6],
+            blob[offset + 7],
+        ]);
+        out.push('{');
+        out.push_str(&rowid.to_string());
+        for j in 0..n_dim2 {
+            let coord_offset = offset + 8 + j * 4;
+            let bytes = [
+                blob[coord_offset],
+                blob[coord_offset + 1],
+                blob[coord_offset + 2],
+                blob[coord_offset + 3],
+            ];
+            let coord = f32::from_le_bytes(bytes);
+            out.push(' ');
+            out.push_str(&format!("{coord}"));
+        }
+        out.push('}');
+    }
+    Value::from_text(out)
+}
 
 /// Escape a column name for use inside SQLite `"identifier"` tokens.
 fn quote_sql_ident(name: &str) -> String {
@@ -3256,5 +3353,85 @@ mod tests {
         assert_eq!(table.shadow_node_table(), "new_name_node");
         assert_eq!(table.shadow_rowid_table(), "new_name_rowid");
         assert_eq!(table.shadow_parent_table(), "new_name_parent");
+    }
+
+    #[test]
+    fn test_rtreedepth_reads_first_two_bytes() {
+        // Big-endian u16 of 5 → depth = 5. Matches `readInt16` in `ext/rtree/rtree.c`.
+        let blob = Value::from_blob(vec![0x00, 0x05, 0x00, 0x00]);
+        let result = compute_rtreedepth(&blob);
+        assert_eq!(result.value_type(), ValueType::Integer);
+        assert_eq!(result.to_integer(), Some(5));
+
+        // depth = 0
+        let blob = Value::from_blob(vec![0x00, 0x00, 0x00, 0x00]);
+        let result = compute_rtreedepth(&blob);
+        assert_eq!(result.to_integer(), Some(0));
+    }
+
+    #[test]
+    fn test_rtreedepth_short_blob_errors() {
+        // Blob shorter than 2 bytes → error (matches SQLite's "Invalid argument to rtreedepth()").
+        let blob = Value::from_blob(vec![0x00]);
+        let result = compute_rtreedepth(&blob);
+        assert_eq!(result.value_type(), ValueType::Error);
+
+        // Non-blob input → error.
+        let text = Value::from_text("hello".to_string());
+        let result = compute_rtreedepth(&text);
+        assert_eq!(result.value_type(), ValueType::Error);
+    }
+
+    #[test]
+    fn test_rtreenode_renders_cell_list() {
+        // Build a 2D node blob with one cell (rowid=42, xmin=0, xmax=10, ymin=5, ymax=15).
+        // Cell layout in the blob: [rowid(8)][xmin(4)][xmax(4)][ymin(4)][ymax(4)].
+        let mut blob = vec![0x00, 0x00]; // depth (unused for n_cells)
+        blob.extend_from_slice(&1u16.to_be_bytes()); // n_cells = 1
+                                                     // rowid = 42 (little-endian)
+        blob.extend_from_slice(&42i64.to_le_bytes());
+        // xmin = 0.0
+        blob.extend_from_slice(&0.0f32.to_le_bytes());
+        // xmax = 10.0
+        blob.extend_from_slice(&10.0f32.to_le_bytes());
+        // ymin = 5.0
+        blob.extend_from_slice(&5.0f32.to_le_bytes());
+        // ymax = 15.0
+        blob.extend_from_slice(&15.0f32.to_le_bytes());
+
+        let result = compute_rtreenode(&Value::from_integer(2), &Value::from_blob(blob));
+        let text = result.to_text().expect("rtreenode should return text");
+        assert!(
+            text.contains("42"),
+            "expected rowid 42 in output, got: {text}"
+        );
+        assert!(
+            text.contains("0"),
+            "expected coord 0 in output, got: {text}"
+        );
+        assert!(
+            text.contains("10"),
+            "expected coord 10 in output, got: {text}"
+        );
+        assert!(
+            text.contains("5"),
+            "expected coord 5 in output, got: {text}"
+        );
+        assert!(
+            text.contains("15"),
+            "expected coord 15 in output, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_rtreenode_invalid_dim_returns_null() {
+        // nDim outside 1..=5 returns NULL (matches SQLite's silent-NULL behavior).
+        let blob = Value::from_blob(vec![0x00, 0x00, 0x00, 0x00]);
+        let result = compute_rtreenode(&Value::from_integer(0), &blob);
+        assert_eq!(result.value_type(), ValueType::Null);
+
+        let blob = Value::from_blob(vec![0x00, 0x00, 0x00, 0x00]);
+        let result = compute_rtreenode(&Value::from_integer(6), &blob);
+        assert_eq!(result.value_type(), ValueType::Null);
     }
 }
