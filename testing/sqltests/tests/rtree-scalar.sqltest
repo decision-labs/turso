@@ -1,0 +1,50 @@
+@database :memory:
+
+# Test the rtreedepth and rtreenode SQL scalar functions.
+# These are debug/analysis functions matching ext/rtree/rtree.c.
+
+# rtreedepth with a valid blob (first 2 bytes = big-endian u16).
+# We pull the blob from a real rtree shadow table so we don't have to
+# hand-craft the binary format in the sqltest.
+setup rt-depth {
+    CREATE VIRTUAL TABLE rt_depth USING rtree(id, xmin, xmax);
+    INSERT INTO rt_depth VALUES(1, 0.0, 10.0);
+}
+
+@setup rt-depth
+test rtreedepth-on-real-root-blob {
+    -- Root node has depth=0 (stored as big-endian u16 in first 2 bytes).
+    SELECT rtreedepth(data) FROM rt_depth_node;
+}
+expect {
+    0
+}
+
+# rtreenode with a valid 1D node with 1 cell.
+# Pull straight from a real rtree shadow table.
+setup rt-node-1d {
+    CREATE VIRTUAL TABLE rt_node_1d USING rtree(id, xmin, xmax);
+    INSERT INTO rt_node_1d VALUES(42, 1.0, 5.0);
+}
+
+@setup rt-node-1d
+test rtreenode-1d-on-real-root-blob {
+    SELECT rtreenode(1, data) FROM rt_node_1d_node;
+}
+expect {
+    {42 1 5}
+}
+
+# rtreenode on a real 2D rtree root blob.
+setup rt-node-2d {
+    CREATE VIRTUAL TABLE rt_node_2d USING rtree(id, xmin, xmax, ymin, ymax);
+    INSERT INTO rt_node_2d VALUES(42, 0.0, 10.0, 5.0, 15.0);
+}
+
+@setup rt-node-2d
+test rtreenode-2d-on-real-root-blob {
+    SELECT rtreenode(2, data) FROM rt_node_2d_node;
+}
+expect {
+    {42 0 10 5 15}
+}
