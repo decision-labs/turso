@@ -4,7 +4,7 @@
 setup rtree {
     CREATE VIRTUAL TABLE rt1 USING rtree(id, xmin, xmax, ymin, ymax);
     INSERT INTO rt1 VALUES(1, 0.0, 10.0, 0.0, 10.0);
-    INSERT INTO rt1 VALUES(2, 5.0, 15.0, 5.0, 15.0);
+    INSERT INTO rt1 VALUES(2, 6.0, 14.0, 5.0, 14.0);
     INSERT INTO rt1 VALUES(3, 20.0, 30.0, 20.0, 30.0);
 }
 
@@ -39,4 +39,59 @@ test delete-one {
 }
 expect {
     2
+}
+
+# rtree-2.* ported from rtree1.test: implicit constraints + auto-assign rowid.
+setup rtree-constraints {
+    CREATE VIRTUAL TABLE rt2 USING rtree(ii, x1, x2, y1, y2);
+}
+
+@setup rtree-constraints
+test empty-table-yields-no-rows {
+    SELECT * FROM rt2;
+}
+expect {
+}
+
+@setup rtree-constraints
+test insert-null-rowid-auto-assigns-1 {
+    INSERT INTO rt2 VALUES(NULL, 1, 3, 2, 4);
+    SELECT * FROM rt2;
+}
+expect {
+    1|1.0|3.0|2.0|4.0
+}
+
+@setup rtree-constraints
+test insert-null-rowid-twice-assigns-1-and-2 {
+    INSERT INTO rt2 VALUES(NULL, 1, 3, 2, 4);
+    INSERT INTO rt2 VALUES(NULL, 1, 3, 2, 4);
+    SELECT ii FROM rt2 ORDER BY ii;
+}
+expect {
+    1
+    2
+}
+
+@setup rtree-constraints
+test unique-rowid-violation {
+    INSERT INTO rt2 VALUES(2, 1, 3, 2, 4);
+    -- second insert with same rowid should fail
+    INSERT INTO rt2 VALUES(2, 1, 3, 2, 4);
+}
+expect error {
+}
+
+@setup rtree-constraints
+test y1-greater-than-y2-violation {
+    INSERT INTO rt2 VALUES(4, 1, 3, 4, 2);
+}
+expect error {
+}
+
+@setup rtree-constraints
+test x1-greater-than-x2-violation {
+    INSERT INTO rt2 VALUES(4, 3, 1, 2, 4);
+}
+expect error {
 }

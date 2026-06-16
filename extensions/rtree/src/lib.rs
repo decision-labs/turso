@@ -1673,61 +1673,57 @@ impl RtreeCursor {
         None
     }
 }
-
 fn leaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize) -> i32 {
     let coord_idx = constraint.i_coord;
     if coord_idx >= n_dim2 * 2 {
         return FULLY_WITHIN;
     }
 
-    let coord_min = if coord_idx < n_dim2 {
-        cell.coords[coord_idx]
-    } else {
-        cell.coords[n_dim2 + (coord_idx % n_dim2)]
-    };
-    let coord_max = if coord_idx < n_dim2 {
-        cell.coords[n_dim2 + coord_idx]
-    } else {
-        cell.coords[coord_idx % n_dim2]
-    };
+    // Storage layout matches SQLite: for an nD-dim rtree, coords are interleaved
+    // as [xmin_0, xmax_0, xmin_1, xmax_1, ...]. So `coord_idx` is the direct position
+    // in the cell's coord array, not a dimension index.
+    let xn = cell.coords[coord_idx];
 
     let val = constraint.value as f32;
     match constraint.op {
         b'A' => {
-            if val != coord_min && val != coord_max {
-                NOT_WITHIN
-            } else {
+            // EQ: cell.coord[coord_idx] == val
+            if xn == val {
                 FULLY_WITHIN
+            } else {
+                NOT_WITHIN
             }
         }
         b'B' => {
-            if val < coord_min {
-                NOT_WITHIN
-            } else if val > coord_max {
-                PARTLY_WITHIN
-            } else {
+            // LE: cell.coord[coord_idx] <= val
+            if xn <= val {
                 FULLY_WITHIN
+            } else {
+                NOT_WITHIN
             }
         }
         b'C' => {
-            if val <= coord_max {
-                NOT_WITHIN
-            } else {
+            // LT: cell.coord[coord_idx] < val
+            if xn < val {
                 FULLY_WITHIN
+            } else {
+                NOT_WITHIN
             }
         }
         b'D' => {
-            if val <= coord_max {
-                NOT_WITHIN
-            } else {
+            // GE: cell.coord[coord_idx] >= val
+            if xn >= val {
                 FULLY_WITHIN
+            } else {
+                NOT_WITHIN
             }
         }
         b'E' => {
-            if val >= coord_min {
-                NOT_WITHIN
-            } else {
+            // GT: cell.coord[coord_idx] > val
+            if xn > val {
                 FULLY_WITHIN
+            } else {
+                NOT_WITHIN
             }
         }
         b'F' => {
@@ -1752,6 +1748,7 @@ fn leaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize
                     let callback = unsafe { &*geom_ptr };
                     let mut result: i32 = 0;
                     let accepted = (callback.x_geom)(&cell.coords[..n_dim2], &params, &mut result);
+
                     if accepted && result != 0 {
                         FULLY_WITHIN
                     } else {
@@ -1763,59 +1760,59 @@ fn leaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize
         _ => FULLY_WITHIN,
     }
 }
-
 fn nonleaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize) -> i32 {
     let coord_idx = constraint.i_coord;
     if coord_idx >= n_dim2 * 2 {
         return FULLY_WITHIN;
     }
 
-    let coord_min = if coord_idx < n_dim2 {
-        cell.coords[coord_idx]
-    } else {
-        cell.coords[n_dim2 + (coord_idx % n_dim2)]
-    };
-    let coord_max = if coord_idx < n_dim2 {
-        cell.coords[n_dim2 + coord_idx]
-    } else {
-        cell.coords[coord_idx % n_dim2]
-    };
+    // Storage layout matches SQLite: coords are interleaved as [xmin_0, xmax_0, xmin_1, xmax_1, ...].
+    // For an internal-node cell, the iCoord might point to a lower or upper bound, so align to the
+    // start of the pair (mask off the low bit) — same `&0xfe` trick as SQLite's rtreeNonleafConstraint.
+    let pair_lo = coord_idx & !1usize;
+    let lower = cell.coords[pair_lo];
+    let upper = cell.coords[pair_lo + 1];
 
     let val = constraint.value as f32;
     match constraint.op {
         b'A' => {
-            if val < coord_min || val > coord_max {
-                NOT_WITHIN
-            } else {
+            // EQ: the cell could contain val iff lower <= val <= upper.
+            if val >= lower && val <= upper {
                 FULLY_WITHIN
+            } else {
+                NOT_WITHIN
             }
         }
         b'B' => {
-            if val < coord_min {
-                NOT_WITHIN
-            } else {
+            // LE: the cell could contain a point <= val iff val >= lower.
+            if val >= lower {
                 FULLY_WITHIN
+            } else {
+                NOT_WITHIN
             }
         }
         b'C' => {
-            if val <= coord_max {
-                NOT_WITHIN
-            } else {
+            // LT: the cell could contain a point < val iff val > lower.
+            if val > lower {
                 FULLY_WITHIN
+            } else {
+                NOT_WITHIN
             }
         }
         b'D' => {
-            if val <= coord_max {
-                NOT_WITHIN
-            } else {
+            // GE: the cell could contain a point >= val iff val <= upper.
+            if val <= upper {
                 FULLY_WITHIN
+            } else {
+                NOT_WITHIN
             }
         }
         b'E' => {
-            if val >= coord_min {
-                NOT_WITHIN
-            } else {
+            // GT: the cell could contain a point > val iff val < upper.
+            if val < upper {
                 FULLY_WITHIN
+            } else {
+                NOT_WITHIN
             }
         }
         b'F' => {
@@ -1839,6 +1836,7 @@ fn nonleaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: us
                     let callback = unsafe { &*geom_ptr };
                     let mut result: i32 = 0;
                     let accepted = (callback.x_geom)(&cell.coords[..n_dim2], &params, &mut result);
+
                     if accepted && result != 0 {
                         FULLY_WITHIN
                     } else {
