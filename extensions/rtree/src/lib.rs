@@ -415,6 +415,10 @@ struct RtreeConstraint {
     i_coord: usize,
     op: u8,
     value: f64,
+    /// When true, the constraint operand was SQL NULL. Comparisons with NULL
+    /// are unknown, so the cell should be rejected (matches SQLite's behavior
+    /// of `x1 > NULL` returning no rows).
+    value_is_null: bool,
     /// Serialized MATCH blob: [4 bytes iSize][8 bytes geom_ptr][8 bytes ctx][8 bytes nParam][params...]
     /// Only populated when op == RTREE_MATCH. Empty Vec means not a MATCH constraint.
     match_blob: Vec<u8>,
@@ -1776,6 +1780,11 @@ fn leaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize
         return FULLY_WITHIN;
     }
 
+    // SQL NULL operand: any comparison is unknown, so the cell is rejected.
+    if constraint.value_is_null {
+        return NOT_WITHIN;
+    }
+
     // Storage layout matches SQLite: for an nD-dim rtree, coords are interleaved
     // as [xmin_0, xmax_0, xmin_1, xmax_1, ...]. So `coord_idx` is the direct position
     // in the cell's coord array, not a dimension index.
@@ -1860,6 +1869,14 @@ fn leaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize
 fn nonleaf_constraint(constraint: &RtreeConstraint, cell: &RtreeCell, n_dim2: usize) -> i32 {
     let coord_idx = constraint.i_coord;
     if coord_idx >= n_dim2 * 2 {
+        return FULLY_WITHIN;
+    }
+
+    // SQL NULL operand: any comparison is unknown, so the subtree can't be
+    // pruned. Return FULLY_WITHIN (still need to descend) and let the leaf
+    // constraint reject every actual cell. This matches SQLite's behavior
+    // where `x1 > NULL` returns no rows.
+    if constraint.value_is_null {
         return FULLY_WITHIN;
     }
 
@@ -2607,14 +2624,22 @@ impl VTabCursor for RtreeCursor {
                             i_coord: coord_idx,
                             op,
                             value: 0.0,
+                            value_is_null: false,
                             match_blob: blob.to_vec(),
                         });
                     }
-                } else if let Some(f) = arg.to_float() {
+                } else {
+                    // Add the constraint even when the value is NULL so the
+                    // scan rejects every cell (SQLite: `x1 > NULL` → no rows).
+                    let (value, is_null) = match arg.to_float() {
+                        Some(f) => (f, false),
+                        None => (0.0, true),
+                    };
                     self.constraints.push(RtreeConstraint {
                         i_coord: coord_idx,
                         op,
-                        value: f,
+                        value,
+                        value_is_null: is_null,
                         match_blob: Vec::new(),
                     });
                 }
@@ -3000,6 +3025,7 @@ mod tests {
             i_coord: 0,
             op: b'E',
             value: 15.0,
+            value_is_null: false,
             match_blob: Vec::new(),
         };
 
@@ -3019,6 +3045,7 @@ mod tests {
             i_coord: 0,
             op: b'B',
             value: 4.0,
+            value_is_null: false,
             match_blob: Vec::new(),
         };
 
