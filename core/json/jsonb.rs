@@ -1,5 +1,7 @@
+use crate::alloc::TursoVecExt;
 use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
+use crate::types::{value_blob_from_slice, ValueBlob};
 use crate::{bail_parse_error, LimboError, Result};
 use std::{
     borrow::Cow,
@@ -176,7 +178,7 @@ static CHARACTER_TYPE_OK: [u8; 256] = make_character_type_ok_table();
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Jsonb {
-    data: Vec<u8>,
+    data: ValueBlob,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -907,11 +909,11 @@ impl Jsonb {
     pub fn new(capacity: usize, data: Option<&[u8]>) -> Self {
         if let Some(data) = data {
             return Self {
-                data: data.to_vec(),
+                data: value_blob_from_slice(data),
             };
         }
         Self {
-            data: Vec::with_capacity(capacity),
+            data: <ValueBlob as TursoVecExt<u8>>::with_capacity(capacity),
         }
     }
 
@@ -921,7 +923,7 @@ impl Jsonb {
 
     pub fn make_empty_array(size: usize) -> Self {
         let mut jsonb = Self {
-            data: Vec::with_capacity(size),
+            data: <ValueBlob as TursoVecExt<u8>>::with_capacity(size),
         };
         jsonb
             .write_element_header(0, ElementType::ARRAY, 0, false)
@@ -931,7 +933,7 @@ impl Jsonb {
 
     pub fn make_empty_obj(size: usize) -> Self {
         let mut jsonb = Self {
-            data: Vec::with_capacity(size),
+            data: <ValueBlob as TursoVecExt<u8>>::with_capacity(size),
         };
         jsonb
             .write_element_header(0, ElementType::OBJECT, 0, false)
@@ -943,7 +945,7 @@ impl Jsonb {
         self.data.extend_from_slice(data);
     }
 
-    pub fn append_jsonb_to_end(&mut self, mut data: Vec<u8>) {
+    pub fn append_jsonb_to_end(&mut self, mut data: ValueBlob) {
         self.data.append(&mut data);
     }
 
@@ -1378,10 +1380,18 @@ impl Jsonb {
                             }
                         }
 
-                        // Default case - just push the character
+                        // Default case - just push the character. `ch` may be the
+                        // lead byte of a multi-byte UTF-8 sequence (e.g. non-ASCII
+                        // letters), so decode the whole sequence rather than
+                        // casting a single byte to `char`, which mangles it.
                         _ => {
-                            string.push(ch as char);
-                            i += 1;
+                            let seq_len = utf8_sequence_len(ch);
+                            let end = (i + seq_len).min(word_slice.len());
+                            match std::str::from_utf8(&word_slice[i..end]) {
+                                Ok(s) => string.push_str(s),
+                                Err(_) => string.push(ch as char),
+                            }
+                            i = end;
                         }
                     }
                 }
@@ -2372,7 +2382,7 @@ impl Jsonb {
         Self::new(data.len(), Some(data))
     }
 
-    pub fn data(self) -> Vec<u8> {
+    pub fn data(self) -> ValueBlob {
         self.data
     }
 
@@ -2594,6 +2604,22 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
+                        None => {
+                            if !mode.allows_insert() {
+                                bail_parse_error!("Cant insert")
+                            }
+                            let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                            let placeholder_bytes = placeholder.as_bytes();
+                            self.data
+                                .splice(end_pos..end_pos, placeholder_bytes.iter().copied());
+
+                            return Ok(JsonTraversalResult::with_array_index(
+                                pos,
+                                JsonLocationKind::ArrayEntry,
+                                placeholder_bytes.len() as isize,
+                                end_pos,
+                            ));
+                        }
                         _ => unreachable!(),
                     }
                 } else {
@@ -2772,6 +2798,23 @@ impl Jsonb {
                             } else {
                                 bail_parse_error!("Element with negative index not found")
                             }
+                        }
+                        None => {
+                            if !mode.allows_insert() {
+                                bail_parse_error!("Cant insert")
+                            }
+                            let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                            let placeholder_bytes = placeholder.as_bytes();
+
+                            self.data
+                                .splice(end_pos..end_pos, placeholder_bytes.iter().copied());
+
+                            return Ok(JsonTraversalResult::with_array_index(
+                                pos,
+                                JsonLocationKind::DocumentRoot,
+                                placeholder_bytes.len() as isize,
+                                end_pos,
+                            ));
                         }
                         _ => unreachable!(),
                     }
@@ -2956,6 +2999,14 @@ impl Jsonb {
                                 let insertion_point = value_idx + value_size + value_header_size;
 
                                 self.data.insert(insertion_point, placeholder_bytes[0]);
+                                let insertion_point = value_idx + value_size + value_header_size;
+
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    value_idx,
+                                    JsonLocationKind::ObjectProperty(key_idx),
+                                    placeholder_bytes.len() as isize,
+                                    insertion_point,
+                                ));
                             } else {
                                 bail_parse_error!("Cant insert")
                             }
@@ -3481,6 +3532,22 @@ fn is_json_ok(ch: u8) -> bool {
     (CHARACTER_TYPE_OK[ch as usize] & 4) != 0
 }
 
+/// Length in bytes of the UTF-8 sequence starting with lead byte `ch`.
+#[inline]
+fn utf8_sequence_len(ch: u8) -> usize {
+    if ch & 0x80 == 0 {
+        1
+    } else if ch & 0xE0 == 0xC0 {
+        2
+    } else if ch & 0xF0 == 0xE0 {
+        3
+    } else if ch & 0xF8 == 0xF0 {
+        4
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3723,6 +3790,15 @@ world""#,
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
         assert!(matches!(header.0, ElementType::TEXT5));
+
+        // Multi-byte UTF-8 alongside a raw control byte (regression for #7786:
+        // TEXT5 serialization was casting each raw byte to `char`, corrupting
+        // multi-byte UTF-8 sequences).
+        let json_input = "\"ä\nworld\"";
+        let parsed = Jsonb::from_str(json_input).unwrap();
+        let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
+        assert!(matches!(header.0, ElementType::TEXT5));
+        assert_eq!(parsed.to_string().unwrap(), "\"ä\\nworld\"");
     }
 
     #[test]
@@ -4534,7 +4610,7 @@ mod path_operations_tests {
         // a value that would cause overflow when added to the position.
         // Header byte: 0xFB = element type ARRAY (11) + size marker 15 (8-byte size)
         // Followed by 8 bytes of near-max u64 value.
-        let malformed: Vec<u8> = vec![
+        let malformed: ValueBlob = crate::alloc::vec![
             0xFB, // ARRAY type (11) with 8-byte payload size marker (15 << 4)
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // huge payload size
         ];

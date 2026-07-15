@@ -1,3 +1,5 @@
+#![cfg_attr(nightly, feature(allocator_api))]
+
 /// Whopper is a deterministic simulator for testing the Turso database.
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -22,6 +24,8 @@ use turso_core::{
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
+mod allocation_fault;
+pub mod chaotic_btree;
 pub mod chaotic_elle;
 pub mod elle;
 pub mod error_handling;
@@ -38,6 +42,10 @@ pub mod workloads;
 mod yield_injection;
 
 use crate::{
+    allocation_fault::{
+        AllocationFaultConfig, AllocationFaultContext, SimulatorAllocationFaultInjector,
+        install_global_allocation_fault_backend,
+    },
     chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile},
     io::FILE_SIZE_SOFT_LIMIT,
     properties::Property,
@@ -78,6 +86,18 @@ fn step_stmt_with_injected_yield(
     connection.set_yield_injector(Some(yield_injector));
     let _guard = InstalledYieldInjector { connection };
     stmt.step()
+}
+
+fn step_stmt_with_injections(
+    connection: &Arc<Connection>,
+    yield_injector: Arc<SimulatorYieldInjector>,
+    allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
+    allocation_fault_context: AllocationFaultContext,
+    stmt: &mut Statement,
+) -> turso_core::Result<turso_core::StepResult> {
+    let _allocation_fault_guard =
+        allocation_fault_injector.map(|injector| injector.enter_context(allocation_fault_context));
+    step_stmt_with_injected_yield(connection, yield_injector, stmt)
 }
 
 /// A bounded container for sampling values with reservoir sampling.
@@ -257,6 +277,8 @@ pub struct WhopperOpts {
     pub keep_files: bool,
     /// Enable MVCC (Multi-Version Concurrency Control).
     pub enable_mvcc: bool,
+    /// Enable the experimental non-blocking (passive) MVCC checkpoint.
+    pub experimental_mvcc_passive_checkpoint: bool,
     /// Enable database encryption with random cipher.
     pub enable_encryption: bool,
     /// Elle tables to create: vec of (table_name, create_sql).
@@ -278,6 +300,8 @@ pub struct WhopperOpts {
     pub close_connections_gracefully: bool,
     /// Probabilty of a reopen fault.
     pub reopen_probability: f64,
+    /// Probability of failing a scoped Turso allocation while stepping a statement.
+    pub allocation_fault_probability: f64,
 }
 
 /// Schema-generation bias
@@ -315,6 +339,7 @@ impl Default for WhopperOpts {
             cosmic_ray_probability: 0.0,
             keep_files: false,
             enable_mvcc: false,
+            experimental_mvcc_passive_checkpoint: false,
             enable_encryption: false,
             elle_tables: vec![],
             workloads: vec![],
@@ -324,6 +349,7 @@ impl Default for WhopperOpts {
             disable_mvcc_auto_checkpoint: false,
             close_connections_gracefully: true,
             reopen_probability: 0.0,
+            allocation_fault_probability: 0.0,
         }
     }
 }
@@ -370,6 +396,35 @@ impl WhopperOpts {
         }
     }
 
+    pub fn schema_clone_faults() -> Self {
+        Self {
+            max_steps: 200_000,
+            schema_bias: SchemaBias {
+                non_rowid_pk_prob: 0.4,
+                unique_col_prob: 0.8,
+                num_tables_range: 6..=12,
+                num_columns_range: 8..=16,
+                initial_rows_per_table: 2,
+            },
+            reopen_probability: 0.05,
+            ..Default::default()
+        }
+    }
+
+    pub fn btree_rebalance() -> Self {
+        Self {
+            max_steps: 500_000,
+            schema_bias: SchemaBias {
+                non_rowid_pk_prob: 0.0,
+                unique_col_prob: 0.0,
+                num_tables_range: 0..=0,
+                num_columns_range: 2..=2,
+                initial_rows_per_table: 0,
+            },
+            ..Default::default()
+        }
+    }
+
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
@@ -405,6 +460,11 @@ impl WhopperOpts {
         self
     }
 
+    pub fn with_experimental_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
+        self.experimental_mvcc_passive_checkpoint = enable;
+        self
+    }
+
     pub fn with_enable_encryption(mut self, enable: bool) -> Self {
         self.enable_encryption = enable;
         self
@@ -430,6 +490,11 @@ impl WhopperOpts {
         profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
     ) -> Self {
         self.chaotic_profiles = profiles;
+        self
+    }
+
+    pub fn with_allocation_fault_probability(mut self, probability: f64) -> Self {
+        self.allocation_fault_probability = probability;
         self
     }
 }
@@ -583,8 +648,11 @@ pub struct Whopper {
     chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
     /// Setting this to true sets `pramga mvcc_checkpoint_threshold = -1` (disabled).
     disable_mvcc_auto_checkpoint: bool,
+    /// Open databases with the experimental non-blocking (passive) MVCC checkpoint enabled.
+    experimental_mvcc_passive_checkpoint: bool,
     /// If false, drop fiber connections without first closing them.
     close_connections_gracefully: bool,
+    allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
 }
 
 impl Whopper {
@@ -596,6 +664,12 @@ impl Whopper {
         });
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let allocation_fault_injector = install_global_allocation_fault_backend(
+            AllocationFaultConfig {
+                probability: opts.allocation_fault_probability,
+            },
+            seed.wrapping_add(2),
+        )?;
 
         // Create a separate RNG for IO operations with a derived seed
         let io_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
@@ -625,7 +699,11 @@ impl Whopper {
         };
 
         let db = {
-            let db_opts = DatabaseOpts::new().with_encryption(encryption_opts.is_some());
+            let db_opts = DatabaseOpts::new()
+                .with_encryption(encryption_opts.is_some())
+                .with_experimental_mvcc_passive_checkpoint(
+                    opts.experimental_mvcc_passive_checkpoint,
+                );
 
             match Database::open_file_with_flags(
                 io.clone(),
@@ -729,7 +807,9 @@ impl Whopper {
             stats: Stats::default(),
             chaotic_profiles: opts.chaotic_profiles,
             disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
+            experimental_mvcc_passive_checkpoint: opts.experimental_mvcc_passive_checkpoint,
             close_connections_gracefully: opts.close_connections_gracefully,
+            allocation_fault_injector,
         };
 
         whopper.open_connections()?;
@@ -740,6 +820,12 @@ impl Whopper {
     /// Check if the simulation is complete (reached max steps or WAL limit).
     pub fn is_done(&self) -> bool {
         self.current_step >= self.max_steps
+    }
+
+    pub fn allocation_fault_count(&self) -> u64 {
+        self.allocation_fault_injector
+            .map(SimulatorAllocationFaultInjector::injected_faults)
+            .unwrap_or(0)
     }
 
     /// Perform a single simulation step.
@@ -789,7 +875,17 @@ impl Whopper {
                     txn_id = txn_id
                 );
                 let _enter = span.enter();
-                let step_result = step_stmt_with_injected_yield(&connection, yield_injector, stmt);
+                let step_result = step_stmt_with_injections(
+                    &connection,
+                    yield_injector,
+                    self.allocation_fault_injector,
+                    AllocationFaultContext {
+                        step: self.current_step as u64,
+                        fiber_idx: fiber_idx as u64,
+                        execution_id: exec_id.unwrap_or(0),
+                    },
+                    stmt,
+                );
                 match step_result {
                     Ok(result) => {
                         trace!("{:?}", result);
@@ -865,7 +961,8 @@ impl Whopper {
                 Err(turso_core::LimboError::Busy
                     | turso_core::LimboError::BusySnapshot
                     | turso_core::LimboError::WriteWriteConflict
-                    | turso_core::LimboError::CommitDependencyAborted)
+                    | turso_core::LimboError::CommitDependencyAborted
+                    | turso_core::LimboError::OutOfMemory)
             ) && ctx.fiber.connection.get_auto_commit()
             {
                 let _ = ctx.fiber.connection.execute("ROLLBACK");
@@ -1116,12 +1213,23 @@ impl Whopper {
         let fiber = &mut self.context.fibers[fiber_idx];
         let connection = fiber.connection.clone();
         let yield_injector = fiber.yield_injector.clone();
+        let exec_id = fiber.execution_id.unwrap_or(0);
 
         let mut stmt_borrow = fiber.statement.borrow_mut();
         let Some(stmt) = stmt_borrow.as_mut() else {
             return Some(Ok(Vec::new()));
         };
-        let step_result = step_stmt_with_injected_yield(&connection, yield_injector, stmt);
+        let step_result = step_stmt_with_injections(
+            &connection,
+            yield_injector,
+            self.allocation_fault_injector,
+            AllocationFaultContext {
+                step: self.current_step as u64,
+                fiber_idx: fiber_idx as u64,
+                execution_id: exec_id,
+            },
+            stmt,
+        );
         match step_result {
             Ok(turso_core::StepResult::Row) => {
                 if let Some(row) = stmt.row() {
@@ -1199,24 +1307,8 @@ impl Whopper {
         }
     }
 
-    /// Reopen the database by closing all connections and recreating them.
-    /// This simulates a database restart/reopen scenario.
-    /// Active statements are run to completion before closing.
-    pub fn reopen(&mut self) -> anyhow::Result<()> {
-        debug!(
-            "Restarting database, completing active statements for {} fibers",
-            self.context.fibers.len()
-        );
-
-        // Drain active statements with a per-reopen budget independent of
-        // `max_steps`. The main loop's step budget governs how long the
-        // simulator runs overall; drain is a finalization phase that runs
-        // until either every fiber's in-flight statement has terminated
-        // (Done/Busy/Err) or `max_drain_steps` iterations elapse. The latter
-        // catches genuine engine-side infinite loops (leaked lock,
-        // unresolvable IO yield). Legitimate IO-heavy operations like
-        // `PRAGMA integrity_check` can run for thousands of yields per page,
-        // so the cap needs to comfortably exceed that.
+    /// Drain in-flight statements on all fibers. Used before reopen.
+    fn drain_active_statements(&mut self, reason: &str) -> anyhow::Result<()> {
         let mut drain_iterations = 0usize;
         while self
             .context
@@ -1233,7 +1325,7 @@ impl Whopper {
                     .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
                     .collect();
                 anyhow::bail!(
-                    "reopen drain exceeded max_drain_steps ({}) with statements still live on \
+                    "{reason} drain exceeded max_drain_steps ({}) with statements still live on \
                      fibers {:?}; likely a leaked lock or other infinite loop in the engine",
                     self.max_drain_steps,
                     stuck,
@@ -1246,24 +1338,24 @@ impl Whopper {
                 let Some(op_result) = self.step_drained_statement(fiber_idx) else {
                     continue;
                 };
-                // Statement finished during drain. Notify properties
-                // so committed_watermark and friends stay in sync
-                // with what the engine actually committed to disk —
-                // a drained autocommit that reached StepResult::Done
-                // ran its inline backing-table writes + commit_txn
-                // before returning, so its sequence writes are durable
-                // on disk even though the user-level statement never
-                // returned to the original generate→init→complete
-                // pipeline. Without this notification, the post-
-                // restart disk can be more (or less) advanced than
-                // the checker's committed_watermark and the restart
-                // assertion misfires.
                 self.finalize_drained_statement(fiber_idx, op_result);
             }
-            self.io.step().unwrap();
+            self.io.step()?;
             drain_iterations += 1;
         }
+        Ok(())
+    }
 
+    /// Reopen the database by closing all connections and recreating them.
+    /// This simulates a database restart/reopen scenario.
+    /// Active statements are run to completion before closing.
+    pub fn reopen(&mut self) -> anyhow::Result<()> {
+        debug!(
+            "Restarting database, completing active statements for {} fibers",
+            self.context.fibers.len()
+        );
+
+        self.drain_active_statements("reopen")?;
         // Close and drop all fiber connections to release database Arc references
         {
             let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
@@ -1426,7 +1518,9 @@ impl Whopper {
 
     /// Open database connections for all fibers.
     fn open_connections(&mut self) -> anyhow::Result<()> {
-        let db_opts = DatabaseOpts::new().with_encryption(self.encryption_opts.is_some());
+        let db_opts = DatabaseOpts::new()
+            .with_encryption(self.encryption_opts.is_some())
+            .with_experimental_mvcc_passive_checkpoint(self.experimental_mvcc_passive_checkpoint);
         let db = Database::open_file_with_flags(
             self.io.clone(),
             &self.db_path,

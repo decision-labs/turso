@@ -650,8 +650,8 @@ pub enum Insn {
         col_name: Arc<str>,
     },
 
-    /// Convert a native record-format BLOB back to JSON text for display.
-    /// Input: reg = record-format BLOB. Output: reg = JSON text '[1,2,3]'.
+    /// Convert a native record-format BLOB back to PostgreSQL-style array text for display.
+    /// Input: reg = record-format BLOB. Output: reg = PG array text like '{1,2,3}'.
     ArrayDecode {
         reg: usize,
     },
@@ -890,7 +890,7 @@ pub enum Insn {
 
     /// Write a blob value into a register.
     Blob {
-        value: Vec<u8>,
+        value: crate::ValueBlob,
         dest: usize,
     },
 
@@ -1690,10 +1690,14 @@ pub enum Insn {
     /// otherwise writes a textual error summary.
     /// Higher-level semantic checks (row/index consistency, constraints, etc.)
     /// are emitted as normal VDBE bytecode in translation.
+    ///
+    /// In passive MVCC mode, `dropped_roots` lists checkpointed objects dropped before the next
+    /// checkpoint; execute walks them after live roots and skips pages already accounted for.
     IntegrityCk {
         db: usize,
         max_errors: usize,
         roots: Vec<i64>,
+        dropped_roots: Vec<i64>,
         message_register: usize,
     },
     RenameTable {

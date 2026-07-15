@@ -225,9 +225,9 @@ pub fn translate_pragma(
         return Ok(());
     }
 
-    let pragma = match PragmaName::from_str(name.name.as_str()) {
-        Ok(pragma) => pragma,
-        Err(_) => bail_parse_error!("Not a valid pragma name"),
+    let Ok(pragma) = PragmaName::from_str(name.name.as_str()) else {
+        // SQLite silently ignores unknown PRAGMA names.
+        return Ok(());
     };
 
     let database_id = resolver.resolve_database_id(name)?;
@@ -591,9 +591,6 @@ fn update_pragma(
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
-            if opts.is_some() && connection.mvcc_enabled() {
-                bail_parse_error!("CDC is not supported in MVCC mode");
-            }
             // InitCdcVersion handles everything at execution time:
             // - For enable: creates CDC table + version table, records version,
             //   reads back actual version, defers CDC state to Halt
@@ -684,6 +681,21 @@ fn update_pragma(
             };
 
             connection.set_mvcc_checkpoint_threshold(threshold)?;
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccGcThreshold => {
+            // 0 is rejected: it would run an inline GC pass on every commit even
+            // with zero new versions (`should_gc` compares growth `>= threshold`),
+            // which is pure overhead. Use -1 to disable, or a positive growth
+            // threshold.
+            let threshold = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(size)) if size == -1 || size >= 1 => size,
+                _ => bail_parse_error!(
+                    "mvcc_gc_threshold must be -1 (disabled) or a positive integer"
+                ),
+            };
+
+            connection.set_mvcc_gc_threshold(threshold)?;
             Ok(TransactionMode::None)
         }
         PragmaName::ForeignKeys => {
@@ -891,14 +903,26 @@ fn query_pragma(
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
+            let passive_allowed = connection.mv_store_for_db(database_id).is_none()
+                || connection.experimental_mvcc_passive_checkpoint_enabled();
             let mode = match value {
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());
-                    CheckpointMode::from_str(&mode_name).map_err(|e| {
+                    let mode = CheckpointMode::from_str(&mode_name).map_err(|e| {
                         LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
-                    })?
+                    })?;
+                    if matches!(mode, CheckpointMode::Passive { .. }) && !passive_allowed {
+                        return Err(LimboError::InvalidArgument(
+                            "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"
+                                .into(),
+                        ));
+                    }
+                    mode
                 }
-                _ => CheckpointMode::Passive {
+                _ if passive_allowed => CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
+                _ => CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
                 },
             };
@@ -1389,12 +1413,37 @@ fn query_pragma(
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_integrity_check(schema, program, resolver, database_id, max_errors)?;
+            // integrity_check verifies the physical file, so for the main MVCC database use the
+            // latest shared schema (which reflects every committed+materialized object) rather
+            // than this connection's possibly-stale tx-snapshot — otherwise a table another
+            // connection just created and checkpointed is missing and its live page is
+            // mis-reported as orphaned.
+            let main_schema = (database_id == 0 && connection.mvcc_enabled())
+                .then(|| connection.db.schema.lock().clone());
+            let schema = main_schema.as_deref().unwrap_or(schema);
+            translate_integrity_check(
+                schema,
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                &connection,
+            )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_quick_check(schema, program, resolver, database_id, max_errors)?;
+            let main_schema = (database_id == 0 && connection.mvcc_enabled())
+                .then(|| connection.db.schema.lock().clone());
+            let schema = main_schema.as_deref().unwrap_or(schema);
+            translate_quick_check(
+                schema,
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                &connection,
+            )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
@@ -1514,6 +1563,14 @@ fn query_pragma(
         }
         PragmaName::MvccCheckpointThreshold => {
             let threshold = connection.mvcc_checkpoint_threshold()?;
+            let register = program.alloc_register();
+            program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccGcThreshold => {
+            let threshold = connection.mvcc_gc_threshold()?;
             let register = program.alloc_register();
             program.emit_int(threshold, register);
             program.emit_result_row(register, 1);

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::alloc::TursoSliceExt;
+use crate::alloc::{TryClone, TursoSliceExt};
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType};
@@ -551,7 +551,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     table: t.table.clone(),
                     identifier: t.identifier.clone(),
                     internal_id: t.internal_id,
-                    using_dedup_hidden_cols: t.using_dedup_hidden_cols.clone(),
+                    using_dedup_hidden_cols: t.using_dedup_hidden_cols.try_clone()?,
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: t.cte_select.clone(),
                     cte_explicit_columns: t.cte_explicit_columns.clone(),
@@ -872,8 +872,7 @@ fn get_subquery_parser<'a>(
                             expr: None,
                         })
                     })
-                    .try_collect::<Result<crate::alloc::Vec<_>>>()
-                    .expect("TODO: fallible allocations")?;
+                    .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
                 let ephemeral_index = Arc::new(Index {
                     columns,
@@ -1690,7 +1689,7 @@ fn emit_materialized_subquery_table(
         0,
         String::new(),
         crate::alloc::vec![],
-        columns.try_to_vec().expect("TODO: fallible allocations"),
+        columns.try_to_vec()?,
         BTreeCharacteristics::HAS_ROWID,
         crate::alloc::vec![],
         crate::alloc::vec![],

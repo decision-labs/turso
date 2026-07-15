@@ -400,6 +400,7 @@ mod tests {
                 enable_generated_columns: false,
                 enable_multiprocess_wal: false,
                 enable_without_rowid: false,
+                enable_experimental_mvcc_passive_checkpoint: false,
                 unsafe_testing: false,
             },
             None,
@@ -1749,7 +1750,7 @@ mod tests {
                 // For integers, type code is 1 for 1-byte int, 2 for 2-byte, etc.
                 // Using type 6 (8-byte integer) for all values
                 // Header: 4 bytes (header size byte + 3 type bytes)
-                let mut payload = vec![
+                let mut payload = crate::alloc::vec![
                     4u8, // header size
                     6u8, // type for rowid (8-byte int)
                     6u8, // type for value (8-byte int)
@@ -1887,7 +1888,7 @@ mod tests {
                 Ok(IOResult::Done(()))
             }
 
-            fn seek_to_last(&mut self, _always_seek: bool) -> Result<IOResult<()>> {
+            fn seek_to_last(&mut self) -> Result<IOResult<()>> {
                 Ok(IOResult::Done(()))
             }
 

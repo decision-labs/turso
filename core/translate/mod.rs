@@ -88,13 +88,19 @@ pub fn translate(
             | ast::Stmt::Update { .. }
     );
 
+    let capture_data_changes_info = if connection.is_mvcc_bootstrap_connection() {
+        None
+    } else {
+        connection.get_capture_data_changes_info().clone()
+    };
     // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
     let mut program = Box::new(ProgramBuilder::new(
         query_mode,
-        connection.get_capture_data_changes_info().clone(),
+        capture_data_changes_info,
         // These options will be extended whithin each translate program
         ProgramBuilderOpts::new(1, 32, 2),
     ));
+    program.set_mvcc_enabled(connection.mvcc_enabled());
 
     program.prologue();
     let mut resolver = Resolver::new(
@@ -501,6 +507,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::TryClone;
     use crate::io::MemoryIO;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::Database;
@@ -547,7 +554,7 @@ mod tests {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
-        let mut schema = db.schema.lock().as_ref().clone();
+        let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         let seq_root_page = schema
             .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
@@ -591,7 +598,7 @@ mod tests {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
-        let mut schema = db.schema.lock().as_ref().clone();
+        let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
 
         let pager = conn.pager.load().clone();

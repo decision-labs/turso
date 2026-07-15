@@ -1482,6 +1482,7 @@ impl BuildSharedWal {
             },
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file.clone()),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -1869,19 +1870,23 @@ impl StreamingWalReader {
             return;
         }
         let wfs = self.wal_shared.read();
-        {
-            let mut frame_cache = wfs.runtime.frame_cache.lock();
-            for (page, mut frames) in state.pending_frames.drain() {
-                // Only include frames up to last valid commit
-                frames.retain(|&f| f <= state.last_valid_frame);
-                if !frames.is_empty() {
-                    frame_cache.entry(page).or_default().extend(frames);
-                }
+        let mut frame_cache = wfs.runtime.frame_cache.lock();
+        for (page, mut frames) in state.pending_frames.drain() {
+            // Only include frames up to last valid commit
+            frames.retain(|&f| f <= state.last_valid_frame);
+            if !frames.is_empty() {
+                frame_cache.entry(page).or_default().extend(frames);
             }
         }
         wfs.metadata
             .max_frame
             .store(state.last_valid_frame, Ordering::Release);
+        // Recovery populates `frame_cache` directly (not via `cache_frame`), so
+        // seed the high-water with the recovered frames; otherwise the first
+        // post-recovery rewind/slot-reuse could go undetected.
+        wfs.runtime
+            .frame_cache_high_water
+            .fetch_max(state.last_valid_frame, Ordering::AcqRel);
     }
 
     /// Finalizes the loading process
@@ -2221,8 +2226,8 @@ mod tests {
     #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::from_f64(std::f64::consts::PI))]
     #[case(&[1, 2], SerialType::const_int0(), Value::from_i64(0))]
     #[case(&[65, 66], SerialType::const_int1(), Value::from_i64(1))]
-    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3]))]
-    #[case(&[], SerialType::blob(0), Value::Blob(vec![]))] // empty blob
+    #[case(&[1, 2, 3], SerialType::blob(3), Value::from_slice(&[1, 2, 3]))]
+    #[case(&[], SerialType::blob(0), Value::from_slice(&[]))] // empty blob
     #[case(&[65, 66, 67], SerialType::text(3), Value::build_text("ABC"))]
     #[case(&[0x80], SerialType::i8(), Value::from_i64(-128))]
     #[case(&[0x80, 0], SerialType::i16(), Value::from_i64(-32768))]

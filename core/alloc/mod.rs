@@ -4,22 +4,34 @@
 //! available. Builds compiled with `--cfg nightly` use Rust's unstable
 //! `allocator_api` collection parameters.
 
-use std::fmt;
+use std::{fmt, ptr::NonNull};
 
+mod allocation_site;
 mod api;
+mod arc;
 mod backend;
 mod collections;
 
+pub use allocation_site::{
+    current_allocation_site, enter_allocation_site, AllocationSite, AllocationSiteGuard,
+    MvStoreAllocationSite, MvccCheckpointAllocationSite, SchemaAllocationSite,
+};
 /// The underlying allocator trait: `allocator_api2::alloc::Allocator` on
 /// stable, `std::alloc::Allocator` on `--cfg nightly` builds.
 pub use api::ApiAllocator;
-pub use api::{AllocError, Layout};
+pub use api::{AllocError, Global, Layout};
+pub use arc::{try_arc_slice_from_slice, try_arc_slice_from_slice_in, ArcSlice};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
+pub(crate) use collections::impl_try_clone_via_clone;
+#[cfg(nightly)]
+pub use collections::TursoFromIteratorIn;
 pub use collections::{
     TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
     TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoSliceExt, TursoTryNewExt,
-    TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
+    TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt, TursoVecInExt,
 };
+
+pub const ALLOC_ERR_MSG: &str = "fallible allocations";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TryReserveError;
@@ -45,10 +57,66 @@ impl From<std::collections::TryReserveError> for TryReserveError {
     }
 }
 
+/// Lets containers whose elements clone infallibly (`TryClone<Error =
+/// Infallible>`) satisfy `TryReserveError: From<T::Error>` bounds.
+impl From<std::convert::Infallible> for TryReserveError {
+    fn from(never: std::convert::Infallible) -> Self {
+        match never {}
+    }
+}
+
+/// Allocator safe to clone into concurrent data structures and deferred drops.
+///
+/// Cloning must be cheap and must not panic. The `'static` bound allows
+/// deferred reclamation to outlive the container that captured the allocator.
+pub trait ConcurrentAllocator: ApiAllocator + Clone + Send + Sync + 'static {}
+
+impl<A: ApiAllocator + Clone + Send + Sync + 'static> ConcurrentAllocator for A {}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TursoAllocator;
 
 pub type Allocator = TursoAllocator;
+
+#[derive(Clone)]
+pub struct DynAllocator {
+    inner: Arc<dyn ApiAllocator + Send + Sync>,
+}
+
+impl DynAllocator {
+    pub fn new<A>(alloc: A) -> Self
+    where
+        A: ApiAllocator + Send + Sync + 'static,
+    {
+        Self {
+            inner: Arc::new(alloc),
+        }
+    }
+}
+
+impl Default for DynAllocator {
+    fn default() -> Self {
+        Self::new(TursoAllocator)
+    }
+}
+
+impl fmt::Debug for DynAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DynAllocator").finish_non_exhaustive()
+    }
+}
+
+unsafe impl ApiAllocator for DynAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.inner.allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe {
+            self.inner.deallocate(ptr, layout);
+        }
+    }
+}
 
 pub type Box<T> = std::boxed::Box<T>;
 
@@ -66,7 +134,7 @@ pub type BoxedSlice<T> = std::boxed::Box<[T], TursoAllocator>;
 #[cfg(not(nightly))]
 pub type Vec<T> = std::vec::Vec<T>;
 #[cfg(nightly)]
-pub type Vec<T> = std::vec::Vec<T, TursoAllocator>;
+pub type Vec<T, A = TursoAllocator> = std::vec::Vec<T, A>;
 
 pub use crate::{__turso_alloc_try_vec as try_vec, __turso_alloc_vec as vec};
 
@@ -129,7 +197,7 @@ macro_rules! __turso_alloc_try_vec {
                 <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
                     $crate::__turso_alloc_vec_count!($($element),+),
                 )?;
-            $(values.try_push($element)?;)+
+            $(values.push($element);)+
             Ok::<_, $crate::alloc::TryReserveError>(values)
         })()
     }};

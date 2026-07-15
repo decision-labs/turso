@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::collate::CollationSeq;
@@ -676,6 +676,35 @@ fn consider_in_seek_access_method(
     }))
 }
 
+fn residual_literal_in_list_eval_cost(
+    constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+    consumed_where_terms: &[usize],
+    input_cardinality: f64,
+    rows_per_outer_row: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let eval_count = input_cardinality * rows_per_outer_row;
+    let comparison_count: f64 = constraints
+        .iter()
+        .filter(|constraint| !consumed_where_terms.contains(&constraint.where_clause_pos.0))
+        .filter(|constraint| {
+            where_clause
+                .get(constraint.where_clause_pos.0)
+                .is_some_and(|term| matches!(term.expr, ast::Expr::InList { .. }))
+        })
+        .filter_map(|constraint| match constraint.operator {
+            ConstraintOperator::In {
+                not: false,
+                estimated_values,
+            } => Some(estimated_values),
+            _ => None,
+        })
+        .sum();
+
+    Cost(eval_count * comparison_count * params.cpu_cost_per_row)
+}
+
 /// Return the best [AccessMethod] for a given join order.
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_access_method_for_join_order(
@@ -830,6 +859,15 @@ fn find_best_access_method_for_btree(
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
+        let in_seek_threshold = best_access_method.cost
+            + residual_literal_in_list_eval_cost(
+                &rhs_constraints.constraints,
+                where_clause,
+                &best_access_method.consumed_where_terms,
+                input_cardinality,
+                best_access_method.estimated_rows_per_outer_row,
+                params,
+            );
         if let Some(in_seek_method) = consider_in_seek_access_method(
             rhs_table,
             rhs_constraints,
@@ -837,7 +875,7 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_access_method.cost,
+            in_seek_threshold,
         )? {
             let mut in_seek_method = in_seek_method;
             if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
@@ -1573,7 +1611,7 @@ fn find_best_access_method_for_subquery(
     }
 
     let ephemeral_index =
-        materialized_subquery_ephemeral_index(rhs_table, subquery, &key_col_positions);
+        materialized_subquery_ephemeral_index(rhs_table, subquery, &key_col_positions)?;
     let (iter_dir, _is_index_ordered, order_satisfiability_bonus) =
         materialized_subquery_order_properties(
             rhs_table,
@@ -1655,8 +1693,9 @@ fn materialized_subquery_ephemeral_index(
     rhs_table: &JoinedTable,
     subquery: &FromClauseSubquery,
     key_col_positions: &[usize],
-) -> Arc<Index> {
-    let mut index_columns: crate::alloc::Vec<IndexColumn> = crate::alloc::vec![];
+) -> Result<Arc<Index>> {
+    let mut index_columns: crate::alloc::Vec<IndexColumn> =
+        crate::alloc::Vec::try_with_capacity_ext(subquery.columns.len())?;
     let mut seen_col_positions = std::collections::HashSet::new();
 
     for &col_pos in key_col_positions {
@@ -1667,31 +1706,35 @@ fn materialized_subquery_ephemeral_index(
         if !seen_col_positions.insert(col_pos) {
             continue;
         }
-        index_columns.push(IndexColumn {
-            name: column.name.clone().unwrap_or_default(),
-            order: SortOrder::Asc,
-            pos_in_table: col_pos,
-            collation: column.collation_opt(),
-            default: column.default.clone(),
-            expr: None,
-        });
+        index_columns
+            .push_within_capacity(IndexColumn {
+                name: column.name.clone().unwrap_or_default(),
+                order: SortOrder::Asc,
+                pos_in_table: col_pos,
+                collation: column.collation_opt(),
+                default: column.default.clone(),
+                expr: None,
+            })
+            .expect("subquery index columns vector was preallocated to subquery.columns.len()");
     }
 
     for (col_pos, column) in subquery.columns.iter().enumerate() {
         if seen_col_positions.contains(&col_pos) {
             continue;
         }
-        index_columns.push(IndexColumn {
-            name: column.name.clone().unwrap_or_default(),
-            order: SortOrder::Asc,
-            pos_in_table: col_pos,
-            collation: column.collation_opt(),
-            default: column.default.clone(),
-            expr: None,
-        });
+        index_columns
+            .push_within_capacity(IndexColumn {
+                name: column.name.clone().unwrap_or_default(),
+                order: SortOrder::Asc,
+                pos_in_table: col_pos,
+                collation: column.collation_opt(),
+                default: column.default.clone(),
+                expr: None,
+            })
+            .expect("subquery index columns vector was preallocated to subquery.columns.len()");
     }
 
-    Arc::new(Index {
+    Ok(Arc::new(Index {
         // Match the runtime autoindex naming so EQP and bytecode make it clear
         // that this is a synthetic probe/index-on-temp-table path.
         name: format!("ephemeral_subquery_{}", rhs_table.internal_id),
@@ -1704,7 +1747,7 @@ fn materialized_subquery_ephemeral_index(
         has_rowid: true,
         index_method: None,
         on_conflict: None,
-    })
+    }))
 }
 
 /// Decide whether the synthetic materialized-subquery index would also satisfy

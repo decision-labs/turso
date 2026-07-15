@@ -222,6 +222,67 @@ impl Property for SimpleKeysDoNotDisappear {
     }
 }
 
+/// Validate a `PRAGMA integrity_check` result. Shared by the inline property and
+/// the post-run final-only check.
+pub fn validate_integrity_check_result(
+    step: usize,
+    fiber_id: usize,
+    result: &OpResult,
+) -> anyhow::Result<()> {
+    match result {
+        Err(error) => {
+            // Concurrency errors are acceptable: the autocommit tx that
+            // PRAGMA integrity_check runs under is CONCURRENT, so any
+            // exclusive DDL (CREATE TABLE/SEQUENCE/INDEX) holding the
+            // exclusive slot when our commit reaches CommitState::Commit
+            // aborts us with WriteWriteConflict (see mod.rs:1928,
+            // "commit aborted due to exclusive tx conflict"). Same class
+            // as the Busy/Snapshot errors already listed — transient,
+            // retry-able, not a real correctness violation.
+            if matches!(
+                error,
+                LimboError::Busy
+                    | LimboError::BusySnapshot
+                    | LimboError::WriteWriteConflict
+                    | LimboError::CommitDependencyAborted
+                    | LimboError::SchemaUpdated
+                    | LimboError::SchemaConflict
+                    | LimboError::OutOfMemory
+            ) {
+                return Ok(());
+            }
+            bail!("step {step}, fiber {fiber_id}: integrity_check failed with error: {error}");
+        }
+        Ok(rows) => {
+            if rows.len() != 1 {
+                bail!(
+                    "step {step}, fiber {fiber_id}: integrity_check returned {} rows, expected 1: {:?}",
+                    rows.len(),
+                    rows
+                );
+            }
+            let row = &rows[0];
+            if row.len() != 1 {
+                bail!(
+                    "step {step}, fiber {fiber_id}: integrity_check row has {} columns, expected 1",
+                    row.len()
+                );
+            }
+            match &row[0] {
+                Value::Text(text) if text.as_str() == "ok" => Ok(()),
+                // "Page N: never used" is informational in MVCC mode, not corruption
+                Value::Text(text) if is_integrity_check_informational(text.as_str()) => Ok(()),
+                other => {
+                    bail!(
+                        "step {step}, fiber {fiber_id}: integrity_check returned {:?}, expected \"ok\"",
+                        other
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Property that validates integrity check results.
 /// Integrity check must either return a busy error or a single row with "ok".
 pub struct IntegrityCheckProperty;
@@ -240,58 +301,7 @@ impl Property for IntegrityCheckProperty {
         if !matches!(op, Operation::IntegrityCheck) {
             return Ok(());
         }
-
-        match result {
-            Err(error) => {
-                // Concurrency errors are acceptable: the autocommit tx that
-                // PRAGMA integrity_check runs under is CONCURRENT, so any
-                // exclusive DDL (CREATE TABLE/SEQUENCE/INDEX) holding the
-                // exclusive slot when our commit reaches CommitState::Commit
-                // aborts us with WriteWriteConflict (see mod.rs:1928,
-                // "commit aborted due to exclusive tx conflict"). Same class
-                // as the Busy/Snapshot errors already listed — transient,
-                // retry-able, not a real correctness violation.
-                if matches!(
-                    error,
-                    LimboError::Busy
-                        | LimboError::BusySnapshot
-                        | LimboError::WriteWriteConflict
-                        | LimboError::CommitDependencyAborted
-                        | LimboError::SchemaUpdated
-                        | LimboError::SchemaConflict
-                ) {
-                    return Ok(());
-                }
-                bail!("step {step}, fiber {fiber_id}: integrity_check failed with error: {error}");
-            }
-            Ok(rows) => {
-                if rows.len() != 1 {
-                    bail!(
-                        "step {step}, fiber {fiber_id}: integrity_check returned {} rows, expected 1: {:?}",
-                        rows.len(),
-                        rows
-                    );
-                }
-                let row = &rows[0];
-                if row.len() != 1 {
-                    bail!(
-                        "step {step}, fiber {fiber_id}: integrity_check row has {} columns, expected 1",
-                        row.len()
-                    );
-                }
-                match &row[0] {
-                    Value::Text(text) if text.as_str() == "ok" => Ok(()),
-                    // "Page N: never used" is informational in MVCC mode, not corruption
-                    Value::Text(text) if is_integrity_check_informational(text.as_str()) => Ok(()),
-                    other => {
-                        bail!(
-                            "step {step}, fiber {fiber_id}: integrity_check returned {:?}, expected \"ok\"",
-                            other
-                        );
-                    }
-                }
-            }
-        }
+        validate_integrity_check_result(step, fiber_id, result)
     }
 }
 
@@ -1163,7 +1173,8 @@ impl Property for SequenceCorrectnessProperty {
                 // ever lets the fiber state drift between generate and
                 // execute we want a clean ignore rather than a spurious
                 // failure.
-                if err_msg.contains("Database is busy")
+                if matches!(e, LimboError::OutOfMemory)
+                    || err_msg.contains("Database is busy")
                     || err_msg.contains("Database schema changed")
                     || err_msg.contains("Database snapshot is stale")
                     || err_msg.contains("Write-write conflict")
@@ -1234,6 +1245,9 @@ impl Property for SequenceCorrectnessProperty {
                     let _ = value;
                 }
                 Err(e) => {
+                    if matches!(e, LimboError::OutOfMemory) {
+                        return Ok(());
+                    }
                     let err_msg = e.to_string();
                     if err_msg.contains("does not exist") {
                         return Ok(());

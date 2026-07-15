@@ -183,7 +183,7 @@ impl ParseSchemaRowsState {
         Self {
             inner: Some(ParseSchemaRowsInner {
                 rows,
-                from_sql_indexes: <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(10).expect("TODO: fallible allocations"),
+                from_sql_indexes: <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG),
                 automatic_indices: HashMap::with_capacity_and_hasher(10, Default::default()),
                 dbsp_state_roots: HashMap::default(),
                 dbsp_state_index_roots: HashMap::default(),
@@ -197,7 +197,7 @@ impl ParseSchemaRowsState {
 /// `state`, feeding each row to `handle_schema_row`, and yields IO instead of
 /// pumping it. Re-invoke after each yielded completion; accumulators persist in
 /// `state`. On completion, populates indices and materialized views.
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn parse_schema_rows(
     state: &mut ParseSchemaRowsState,
     schema: &mut Schema,
@@ -295,6 +295,20 @@ pub fn check_ident_equivalency(ident1: &str, ident2: &str) -> bool {
         identifier
     }
     strip_quotes(ident1).eq_ignore_ascii_case(strip_quotes(ident2))
+}
+
+/// Returns true if `sql` parses as a `CREATE VIRTUAL TABLE` statement.
+///
+/// Like SQLite (whose `sqlite3InitCallback` feeds schema SQL to the real
+/// parser, so a row is a virtual table purely as a byproduct of the
+/// `create_vtab` grammar rule), classification is done by parsing rather than
+/// by substring or token matching, which would misclassify regular tables
+/// whose SQL merely contains the text (e.g. in a DEFAULT literal).
+pub fn sql_is_create_virtual_table(sql: &str) -> bool {
+    matches!(
+        Parser::new(sql.as_bytes()).next_cmd(),
+        Ok(Some(ast::Cmd::Stmt(ast::Stmt::CreateVirtualTable(_))))
+    )
 }
 
 pub fn module_name_from_sql(sql: &str) -> Result<&str> {
@@ -1521,7 +1535,7 @@ impl ViewColumnSchema {
             .iter()
             .map(|vc| vc.column.clone())
             .try_collect()
-            .expect("TODO: fallible allocations")
+            .expect(crate::alloc::ALLOC_ERR_MSG)
     }
 
     /// Get columns that belong to a specific table
@@ -2348,7 +2362,7 @@ mod rename_column_view {
             .into_iter()
             .map(|vc| vc.column)
             .try_collect()
-            .expect("TODO: fallible allocations")
+            .expect(crate::alloc::ALLOC_ERR_MSG)
     }
 
     fn view_columns_from_select(
@@ -6227,6 +6241,40 @@ pub mod tests {
             parse_numeric_str("1.23e4extra"),
             Ok((ValueType::Float, "1.23e4"))
         );
+    }
+
+    #[test]
+    fn test_sql_is_create_virtual_table() {
+        assert!(sql_is_create_virtual_table(
+            "CREATE VIRTUAL TABLE x USING y;"
+        ));
+        assert!(sql_is_create_virtual_table(
+            "create virtual table x using y"
+        ));
+        assert!(sql_is_create_virtual_table(
+            "  \n\tCREATE  VIRTUAL TABLE x USING y"
+        ));
+        assert!(sql_is_create_virtual_table(
+            "-- comment\nCREATE /* c */ VIRTUAL TABLE x USING y"
+        ));
+        assert!(sql_is_create_virtual_table(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS x USING y(a, b)"
+        ));
+        // Quoted identifiers must not confuse the classifier either way.
+        assert!(sql_is_create_virtual_table(
+            "CREATE VIRTUAL TABLE \"create table\" USING y"
+        ));
+        // Regular table whose SQL merely contains the text must not match.
+        assert!(!sql_is_create_virtual_table(
+            "CREATE TABLE t(x TEXT DEFAULT 'create virtual')"
+        ));
+        assert!(!sql_is_create_virtual_table(
+            "CREATE TABLE \"create virtual\"(x)"
+        ));
+        assert!(!sql_is_create_virtual_table("CREATE TABLE t(x)"));
+        assert!(!sql_is_create_virtual_table("CREATE VIRTUALX TABLE t(x)"));
+        assert!(!sql_is_create_virtual_table("CREATE VIRTUAL"));
+        assert!(!sql_is_create_virtual_table(""));
     }
 
     #[test]

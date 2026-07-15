@@ -28,7 +28,8 @@ experimental_win_iocp = []
 time = []
 fuzz = []
 omit_autovacuum = []
-simulator = ["fuzz", "serde", "io_memory_yield"]
+simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric"]
+allocation_metric = []
 # Test only: exposed to testing/stress and the simulator, never to regular library users.
 io_memory_yield = []
 serde = ["dep:serde"]
@@ -48,6 +49,12 @@ percentile = []
 rtree = ["limbo_rtree"]
 
 [dependencies]
+# aristo SDK from crates.io (0.4.x — latest; also carries the aristo::instrument
+# surface behind the `aristo_instrument` feature, for future state-exposure
+# accessors). Was a local sibling path (../../aristo) pre-OSS; the conformance
+# harness resolves aristo + aristo-macros from crates.io, so no vendored mount
+# / path-rewrite is needed.
+aristo = "0.4"
 turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
@@ -157,6 +164,7 @@ pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 
 [dev-dependencies]
 memory-stats = "1.2.0"
+serde_json = { workspace = true }
 criterion = { workspace = true, features = [
     "html_reports",
     "async",
@@ -181,6 +189,10 @@ divan.workspace = true
 
 [[bench]]
 name = "benchmark"
+harness = false
+
+[[bench]]
+name = "count_benchmark"
 harness = false
 
 [[bench]]
@@ -240,4 +252,8 @@ harness = false
 
 [[bench]]
 name = "struct_union_profile"
+harness = false
+
+[[bench]]
+name = "prepare_params_benchmark"
 harness = false

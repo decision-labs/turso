@@ -28,12 +28,13 @@ use memory_benchmark::workload::{
 
 const MODES: [JournalMode; 2] = [JournalMode::Wal, JournalMode::Mvcc];
 
-const WORKLOADS: [WorkloadProfile; 5] = [
+const WORKLOADS: [WorkloadProfile; 6] = [
     WorkloadProfile::InsertHeavy,
     WorkloadProfile::ReadHeavy,
     WorkloadProfile::Mixed,
     WorkloadProfile::ScanHeavy,
     WorkloadProfile::SeriesBlob,
+    WorkloadProfile::UpdateChurn,
 ];
 
 /// Workload scale series: the base iteration count is multiplied by each of
@@ -62,6 +63,7 @@ fn base_workload_size(workload: WorkloadProfile) -> (usize, usize) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_memory_profiles(c: &mut Criterion) {
     let work_dir = std::env::temp_dir().join(format!("turso-memory-bench-{}", std::process::id()));
     std::fs::create_dir_all(&work_dir).expect("failed to create bench work dir");
@@ -88,6 +90,7 @@ fn bench_memory_profiles(c: &mut Criterion) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_workload(
     c: &mut Criterion,
     work_dir: &std::path::Path,
@@ -111,6 +114,7 @@ fn bench_workload(
         checkpoint,
         mvcc_checkpoint_threshold: (checkpoint && matches!(mode, JournalMode::Mvcc))
             .then_some(MVCC_CHECKPOINT_THRESHOLD_BYTES),
+        mvcc_gc_threshold: (matches!(mode, JournalMode::Mvcc)).then_some(16384i64),
     };
     let db_path = work_dir
         .join(format!("{mode}_{workload}_{total_ops}{suffix}.db"))

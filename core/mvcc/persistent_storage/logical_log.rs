@@ -236,6 +236,7 @@ use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
 use crate::{
+    alloc::{ConcurrentAllocator, TursoAllocator},
     io::{CompletionGroup, ReadComplete},
     io_yield_one,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
@@ -293,10 +294,18 @@ const OP_EXT_FIELD_DELETE_IDENTITY_RECORD: u64 = 1;
 const OP_EXT_FIELD_DELETE_PK_RECORD: u64 = 2;
 const OP_EXT_FIELD_DELETE_ROWID: u64 = 3;
 
-#[derive(Default)]
 struct DeletePortableExtension {
-    identity_record: Vec<u8>,
-    pk_record: Vec<u8>,
+    identity_record: crate::ValueBlob,
+    pk_record: crate::ValueBlob,
+}
+
+impl Default for DeletePortableExtension {
+    fn default() -> Self {
+        Self {
+            identity_record: crate::alloc::vec![],
+            pk_record: crate::alloc::vec![],
+        }
+    }
 }
 
 const TX_HEADER_SIZE_V2: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
@@ -553,6 +562,7 @@ pub struct LogicalLog {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
+    max_appended_commit_ts: u64,
 }
 
 impl LogicalLog {
@@ -571,6 +581,7 @@ impl LogicalLog {
             pending_running_crc: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
+            max_appended_commit_ts: 0,
         }
     }
 
@@ -620,6 +631,7 @@ impl LogicalLog {
     ) -> Result<(Completion, u64)> {
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
+        self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
         // `tx.buf` is laid out as:
         //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
         debug_assert!(
@@ -630,7 +642,7 @@ impl LogicalLog {
         let payload_size_u64 = payload_size as u64;
 
         #[cfg(feature = "conn_raw_api")]
-        let has_portable_changes = !tx.portable_changes.is_empty();
+        let has_portable_changes = tx.portable_changes_required || !tx.portable_changes.is_empty();
         #[cfg(not(feature = "conn_raw_api"))]
         let has_portable_changes = false;
         #[cfg(feature = "conn_raw_api")]
@@ -978,7 +990,7 @@ impl LogicalLog {
         self.write_header(header)
     }
 
-    pub fn truncate(&mut self) -> Result<Completion> {
+    fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
         let mut header = self.current_or_new_header()?;
@@ -994,7 +1006,20 @@ impl LogicalLog {
         });
         let c = self.file.truncate(0, completion)?;
         self.offset = 0;
+        self.max_appended_commit_ts = 0;
         Ok(c)
+    }
+
+    /// Truncate when `max_appended_commit_ts <= boundary`; passive uses `durable_txid_max_new`,
+    /// truncate mode uses `u64::MAX` (always empty after checkpoint).
+    pub fn truncate(&mut self, checkpointed_through_ts: u64) -> Result<Completion> {
+        if self.max_appended_commit_ts > checkpointed_through_ts {
+            // Uncheckpointed frames remain — skip truncation.
+            let c = Completion::new_trunc(|_| {});
+            c.complete(0);
+            return Ok(c);
+        }
+        self.truncate_to_zero()
     }
 
     /// Reset the log to a header-only file and return one completion for the
@@ -1235,7 +1260,8 @@ fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableEx
                         "delete identity record exceeds op extension".into(),
                     ));
                 }
-                decoded.identity_record = extension[offset..end].to_vec();
+                decoded.identity_record =
+                    crate::types::value_blob_from_slice(&extension[offset..end]);
                 offset = end;
             }
             (OP_EXT_FIELD_DELETE_PK_RECORD, 2) => {
@@ -1251,7 +1277,7 @@ fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableEx
                         "delete PK record exceeds op extension".into(),
                     ));
                 }
-                decoded.pk_record = extension[offset..end].to_vec();
+                decoded.pk_record = crate::types::value_blob_from_slice(&extension[offset..end]);
                 offset = end;
             }
             (OP_EXT_FIELD_DELETE_ROWID, 0) => {
@@ -1551,7 +1577,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             if rowid_len > payload.len() {
                 return Err(LimboError::Corrupt("rowid_len > payload".into()));
             }
-            let record_bytes = payload[rowid_len..].to_vec();
+            let record_bytes = crate::types::value_blob_from_slice(&payload[rowid_len..]);
             let rowid = RowID::new(table_id, RowKey::Int(rowid_u64 as i64));
             ParsedOp::UpsertTable {
                 table_id,
@@ -1570,8 +1596,8 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
                     "DELETE_TABLE payload size mismatch".into(),
                 ));
             }
-            let mut record_bytes = payload[rowid_len..].to_vec();
-            let mut pk_record_bytes = Vec::new();
+            let mut record_bytes = crate::types::value_blob_from_slice(&payload[rowid_len..]);
+            let mut pk_record_bytes = crate::alloc::vec![];
             if !extension.is_empty() {
                 let decoded = decode_delete_portable_extension(extension)?;
                 if record_bytes.is_empty() {
@@ -1590,13 +1616,13 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
         }
         OP_UPSERT_INDEX => ParsedOp::UpsertIndex {
             table_id: table_id.expect("index op must have table_id"),
-            payload: payload.to_vec(),
+            payload: crate::types::value_blob_from_slice(payload),
             commit_ts,
             btree_resident,
         },
         OP_DELETE_INDEX => ParsedOp::DeleteIndex {
             table_id: table_id.expect("index op must have table_id"),
-            payload: payload.to_vec(),
+            payload: crate::types::value_blob_from_slice(payload),
             commit_ts,
             btree_resident,
         },
@@ -1941,6 +1967,10 @@ impl StreamingLogicalLogReader {
         }
 
         let header_bytes = return_if_io!(self.read_exact_at(0, LOG_HDR_SIZE));
+        // All-zero header means no durable log header yet (pre-fsync crash), not corruption.
+        if header_bytes.iter().all(|&b| b == 0) {
+            return Ok(IOResult::Done(HeaderReadResult::NoLog));
+        }
         let hdr_len = u16::from_le_bytes([header_bytes[6], header_bytes[7]]) as usize;
         if hdr_len != LOG_HDR_SIZE {
             self.set_invalid_header_state();
@@ -2013,7 +2043,7 @@ impl StreamingLogicalLogReader {
                     let ops = match return_if_io!(self.parse_next_transaction()) {
                         ParseResult::Frame(frame) => frame.ops,
                         ParseResult::Eof | ParseResult::InvalidFrame => {
-                            return Ok(IOResult::Done(None))
+                            return Ok(IOResult::Done(None));
                         }
                     };
 
@@ -2385,7 +2415,7 @@ impl StreamingLogicalLogReader {
             )) {
                 EncryptedChunkReadResult::Ok { running_crc } => running_crc,
                 EncryptedChunkReadResult::Eof => {
-                    return Ok(IOResult::Done(PayloadParseResult::Eof))
+                    return Ok(IOResult::Done(PayloadParseResult::Eof));
                 }
             };
 
@@ -2637,7 +2667,7 @@ impl StreamingLogicalLogReader {
                 running_crc = crc32c::crc32c_append(running_crc, &extension);
                 (extension, extension_len_bytes_len + extension_len)
             } else {
-                (Vec::new(), 0)
+                (crate::alloc::vec![], 0)
             };
 
             let op_total_bytes = 6 + payload_len_bytes_len + payload_len + extension_total_bytes;
@@ -2687,7 +2717,7 @@ impl StreamingLogicalLogReader {
                     let rowid_i64 = rowid_u64 as i64;
                     let mut payload = payload;
                     let mut record_bytes = payload.split_off(rowid_len);
-                    let mut pk_record_bytes = Vec::new();
+                    let mut pk_record_bytes = crate::alloc::vec![];
                     if !portable_extension.is_empty() {
                         let decoded = decode_delete_portable_extension(&portable_extension)?;
                         if record_bytes.is_empty() {
@@ -3113,7 +3143,7 @@ impl StreamingLogicalLogReader {
             )? {
                 IOResult::Done(PayloadParseResult::Ok(ops, crc)) => (ops, crc),
                 IOResult::Done(PayloadParseResult::Eof) => {
-                    return Ok(IOResult::Done(PayloadOutcome::Eof))
+                    return Ok(IOResult::Done(PayloadOutcome::Eof));
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
@@ -3471,6 +3501,15 @@ impl StreamingLogicalLogReader {
         parsed_op: ParsedOp,
         get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
     ) -> Result<StreamingResult> {
+        self.parsed_op_to_streaming_in(parsed_op, get_index_info, TursoAllocator)
+    }
+
+    pub(crate) fn parsed_op_to_streaming_in<A: ConcurrentAllocator>(
+        &self,
+        parsed_op: ParsedOp,
+        get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
+        alloc: A,
+    ) -> Result<StreamingResult> {
         match parsed_op {
             ParsedOp::UpsertTable {
                 table_id,
@@ -3481,12 +3520,17 @@ impl StreamingLogicalLogReader {
             } => {
                 // Compute column_count from the serialized record so recovered rows keep
                 // the same shape metadata as non-recovered rows.
+                // Decode shape metadata by reference; ownership is only needed for the row payload.
                 let column_count =
                     crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
-                let row = Row::new_table_row(
-                    RowID::new(table_id, rowid.row_id.clone()),
-                    record_bytes,
-                    column_count,
+                let row = crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row_in(
+                        RowID::new(table_id, rowid.row_id.clone()),
+                        &record_bytes,
+                        column_count,
+                        alloc,
+                    )?
                 );
                 Ok(StreamingResult::UpsertTableRow {
                     row,
@@ -3556,7 +3600,7 @@ impl StreamingLogicalLogReader {
         bytes_in_buffer + bytes_in_file
     }
 
-    fn try_consume_bytes(&mut self, amount: usize) -> Result<IOResult<Option<Vec<u8>>>> {
+    fn try_consume_bytes(&mut self, amount: usize) -> Result<IOResult<Option<crate::ValueBlob>>> {
         if self.remaining_bytes() < amount {
             return Ok(IOResult::Done(None));
         }
@@ -3564,7 +3608,7 @@ impl StreamingLogicalLogReader {
         let buffer = self.buffer.read();
         let start = self.buffer_offset;
         let end = start + amount;
-        let bytes = buffer[start..end].to_vec();
+        let bytes = crate::types::value_blob_from_slice(&buffer[start..end]);
         self.buffer_offset = end;
         Ok(IOResult::Done(Some(bytes)))
     }
@@ -3863,26 +3907,26 @@ pub(crate) enum ParsedOp {
     UpsertTable {
         table_id: MVTableId,
         rowid: RowID,
-        record_bytes: Vec<u8>,
+        record_bytes: crate::ValueBlob,
         commit_ts: u64,
         btree_resident: bool,
     },
     DeleteTable {
         rowid: RowID,
-        record_bytes: Vec<u8>,
-        pk_record_bytes: Vec<u8>,
+        record_bytes: crate::ValueBlob,
+        pk_record_bytes: crate::ValueBlob,
         commit_ts: u64,
         btree_resident: bool,
     },
     UpsertIndex {
         table_id: MVTableId,
-        payload: Vec<u8>,
+        payload: crate::ValueBlob,
         commit_ts: u64,
         btree_resident: bool,
     },
     DeleteIndex {
         table_id: MVTableId,
-        payload: Vec<u8>,
+        payload: crate::ValueBlob,
         commit_ts: u64,
         btree_resident: bool,
     },
@@ -3970,6 +4014,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -3986,7 +4031,7 @@ mod tests {
     enum ExpectedTableOp {
         Upsert {
             rowid: i64,
-            payload: Vec<u8>,
+            payload: crate::ValueBlob,
             commit_ts: u64,
             btree_resident: bool,
         },
@@ -4075,6 +4120,7 @@ mod tests {
             }),
             row,
             btree_resident,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
         let c = log.log_tx(tx).unwrap();
@@ -4200,6 +4246,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row(table_id, rowid, data),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -4417,9 +4464,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             // now insert a row into table -2
@@ -4489,9 +4537,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -4603,9 +4652,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -4809,6 +4859,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         });
         let c = log.log_tx(tx1).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -4822,6 +4873,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         });
         let c = log.log_tx(tx2).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -4891,9 +4943,9 @@ mod tests {
             read_back[0],
             ExpectedTableOp::Upsert {
                 rowid: 1,
-                payload: generate_simple_string_row((-2).into(), 1, "a")
-                    .payload()
-                    .to_vec(),
+                payload: crate::types::value_blob_from_slice(
+                    generate_simple_string_row((-2).into(), 1, "a").payload(),
+                ),
                 commit_ts: 1,
                 btree_resident: false,
             }
@@ -4902,9 +4954,9 @@ mod tests {
             read_back[1],
             ExpectedTableOp::Upsert {
                 rowid: 2,
-                payload: generate_simple_string_row((-2).into(), 2, "b")
-                    .payload()
-                    .to_vec(),
+                payload: crate::types::value_blob_from_slice(
+                    generate_simple_string_row((-2).into(), 2, "b").payload(),
+                ),
                 commit_ts: 2,
                 btree_resident: false,
             }
@@ -4977,6 +5029,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row: row3,
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             }],
             None,
         );
@@ -5038,6 +5091,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row: generate_simple_string_row((-2).into(), 1, "first"),
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             }],
             None,
         );
@@ -5055,6 +5109,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row: generate_simple_string_row((-2).into(), 2, "second"),
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             }],
             None,
         );
@@ -5114,6 +5169,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -5175,9 +5231,9 @@ mod tests {
             read_back[0],
             ExpectedTableOp::Upsert {
                 rowid: 1,
-                payload: generate_simple_string_row((-2).into(), 1, "first")
-                    .payload()
-                    .to_vec(),
+                payload: crate::types::value_blob_from_slice(
+                    generate_simple_string_row((-2).into(), 1, "first").payload(),
+                ),
                 commit_ts: 1,
                 btree_resident: false,
             }
@@ -5315,9 +5371,9 @@ mod tests {
             ops,
             vec![ExpectedTableOp::Upsert {
                 rowid: 1,
-                payload: generate_simple_string_row((-2).into(), 1, "a")
-                    .payload()
-                    .to_vec(),
+                payload: crate::types::value_blob_from_slice(
+                    generate_simple_string_row((-2).into(), 1, "a").payload(),
+                ),
                 commit_ts: 10,
                 btree_resident: false,
             }]
@@ -5588,6 +5644,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row((-2).into(), 42, "flip"),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         });
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -5665,10 +5722,12 @@ mod tests {
                         )),
                         row: Row::new_table_row(
                             RowID::new((-2).into(), RowKey::Int(rowid)),
-                            Vec::new(),
+                            &[],
                             0,
-                        ),
+                        )
+                        .unwrap(),
                         btree_resident,
+                        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                     });
                     expected.push(ExpectedTableOp::Delete {
                         rowid,
@@ -5686,10 +5745,11 @@ mod tests {
                         end: crate::mvcc::database::PackedTs::pack(None),
                         row: row.clone(),
                         btree_resident,
+                        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                     });
                     expected.push(ExpectedTableOp::Upsert {
                         rowid,
-                        payload: row.payload().to_vec(),
+                        payload: crate::types::value_blob_from_slice(row.payload()),
                         commit_ts: tx.tx_timestamp,
                         btree_resident,
                     });
@@ -5709,7 +5769,7 @@ mod tests {
             let row = generate_simple_string_row((-3).into(), rowid, &large_text);
             expected.push(ExpectedTableOp::Upsert {
                 rowid,
-                payload: row.payload().to_vec(),
+                payload: crate::types::value_blob_from_slice(row.payload()),
                 commit_ts: large_commit_ts,
                 btree_resident: false,
             });
@@ -5721,6 +5781,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row,
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             });
         }
         let c = log.log_tx(large_tx).unwrap();
@@ -5731,7 +5792,6 @@ mod tests {
     }
 
     /// What this property checks: For arbitrary event sequences, write/read round-trip preserves operation intent.
-    /// Why this matters: Property checks broaden coverage beyond hand-crafted examples.
     #[quickcheck]
     fn prop_logical_log_roundtrip_sequence(events: Vec<(bool, i64, bool)>) -> bool {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
@@ -5762,6 +5822,7 @@ mod tests {
                 }),
                 row: row.clone(),
                 btree_resident,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             };
             expected.push(if is_delete {
                 ExpectedTableOp::Delete {
@@ -5772,7 +5833,7 @@ mod tests {
             } else {
                 ExpectedTableOp::Upsert {
                     rowid,
-                    payload: row.payload().to_vec(),
+                    payload: crate::types::value_blob_from_slice(row.payload()),
                     commit_ts,
                     btree_resident,
                 }
@@ -5794,7 +5855,6 @@ mod tests {
     }
 
     /// What this property checks: Streaming varint decode returns the original value for encoded inputs.
-    /// Why this matters: Varint correctness is required for rowid and payload-length decoding.
     #[quickcheck]
     fn prop_streaming_varint_roundtrip(value: u64) -> bool {
         let mut encoded = [0u8; 9];
@@ -5821,7 +5881,6 @@ mod tests {
     }
 
     /// What this property checks: The streaming varint decoder agrees with the reference decoder on the same bytes.
-    /// Why this matters: Decoder agreement reduces risk of split-brain parsing behavior.
     #[quickcheck]
     fn prop_streaming_varint_matches_read_varint(bytes: Vec<u8>) -> bool {
         let bytes = if bytes.len() > 16 {
@@ -5867,6 +5926,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: true,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -5928,6 +5988,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -6018,8 +6079,9 @@ mod tests {
         let salt_before = log.header.as_ref().unwrap().salt;
 
         // Truncate to 0 (simulates checkpoint truncation); header with new salt
-        // will be written together with the next frame.
-        let c = log.truncate().unwrap();
+        // will be written together with the next frame. u64::MAX boundary => all
+        // frames are considered checkpointed, so it truncates unconditionally.
+        let c = log.truncate(u64::MAX).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let salt_after = log.header.as_ref().unwrap().salt;
@@ -6222,6 +6284,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -6239,15 +6302,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let sortable_key = SortableIndexKey::new_from_record(
-            key_record,
-            Arc::new(IndexInfo {
-                has_rowid: true,
-                num_cols: 2,
-                is_unique: false,
-                ..Default::default()
-            }),
-        );
+        let sortable_key = SortableIndexKey::new_from_record(key_record, test_index_info());
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
@@ -6258,16 +6313,31 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
     fn test_index_info() -> Arc<IndexInfo> {
-        Arc::new(IndexInfo {
-            has_rowid: true,
-            num_cols: 2,
-            is_unique: false,
-            ..Default::default()
-        })
+        Arc::new(
+            IndexInfo::new(
+                [
+                    crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                    crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                ],
+                true,
+                2,
+                false,
+            )
+            .unwrap(),
+        )
     }
 
     fn make_test_raw_table_row_version(
@@ -6277,7 +6347,8 @@ mod tests {
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
-        let row = Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), record_bytes, 1);
+        let row =
+            Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), &record_bytes, 1).unwrap();
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
             begin: crate::mvcc::database::PackedTs::pack(if is_delete {
@@ -6292,6 +6363,7 @@ mod tests {
             }),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -6302,7 +6374,10 @@ mod tests {
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
-        let sortable_key = SortableIndexKey::new_from_bytes(payload_bytes, test_index_info());
+        let sortable_key = SortableIndexKey::new_from_bytes(
+            crate::types::value_blob_from_slice(&payload_bytes),
+            test_index_info(),
+        );
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
@@ -6319,6 +6394,7 @@ mod tests {
             }),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -6669,7 +6745,7 @@ mod tests {
         ParsedOp::UpsertTable {
             table_id: (-2).into(),
             rowid: RowID::new((-2).into(), RowKey::Int(rowid)),
-            record_bytes: row_version.row.payload().to_vec(),
+            record_bytes: crate::types::value_blob_from_slice(row_version.row.payload()),
             commit_ts,
             btree_resident: false,
         }
