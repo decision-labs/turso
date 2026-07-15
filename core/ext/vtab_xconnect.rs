@@ -50,11 +50,19 @@ pub unsafe extern "C" fn execute(
                         }
                     }
                 }
+                // Extensions run their own shadow-table writes (e.g. rtree's
+                // %_node / %_rowid / %_parent) from inside an active INSERT
+                // (the `insert` vtab method is itself a write statement). Mark
+                // this run as nested so the same-connection conflict check
+                // (StatementsInProgress) doesn't reject it. The increment is
+                // balanced when the statement drops.
+                conn.start_nested();
                 let result = stmt.run_with_row_callback(|_| {
                     Err(crate::LimboError::InternalError(String::from(
                         "execute used for query returning a row",
                     )))
                 });
+                conn.end_nested();
                 let rc = match result {
                     Ok(_) => {
                         *last_insert_rowid = conn.last_insert_rowid();

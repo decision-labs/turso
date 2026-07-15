@@ -37,6 +37,7 @@
 //! **not yet wired to SQL** — turso_ext scalar functions don't receive a `Connection`, so a SQL-callable
 //! `rtreecheck()` cannot be registered today; the pure-geometry slice is unit-tested via [`RtreeTable::check_cell_geometry`].
 
+use std::num::NonZero;
 use std::sync::Arc;
 use turso_ext::{
     register_extension, scalar, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage,
@@ -612,6 +613,13 @@ impl RtreeTable {
         format!("{}_parent", self.table_name)
     }
 
+    fn shadow_table_exists(&self, conn: &Arc<Connection>, name: &str) -> Result<bool, ResultCode> {
+        let sql = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1";
+        let stmt = conn.prepare(sql).map_err(|_| ResultCode::Error)?;
+        stmt.bind_at(NonZero::new(1).unwrap(), Value::from_text(name.to_string()));
+        Ok(stmt.step() == StepResult::Row)
+    }
+
     fn load_root_node(&self, conn: &Arc<Connection>) -> Result<RtreeNode, ResultCode> {
         let sql = format!(
             "SELECT data FROM {} WHERE nodeno = 1",
@@ -641,6 +649,15 @@ impl RtreeTable {
     }
 
     fn create_shadow_tables(&mut self, conn: &Arc<Connection>) -> Result<(), ResultCode> {
+        // Shadow table creation must tolerate being called multiple times against
+        // the same connection (e.g. when CREATE VIRTUAL TABLE is re-run for a
+        // table that already has shadow tables). Core rejects write statements
+        // from within an active write statement on the same connection, so we
+        // probe with a read first and skip the CREATE when the table exists.
+        if self.shadow_table_exists(conn, &self.shadow_node_table())? {
+            return Ok(());
+        }
+
         let node_sql = format!(
             "CREATE TABLE {} (nodeno INTEGER PRIMARY KEY, data BLOB)",
             self.shadow_node_table()
@@ -649,22 +666,26 @@ impl RtreeTable {
             .map_err(|_| ResultCode::Error)?;
 
         let mut rowid_sql = format!(
-            "CREATE TABLE {} (rowid INTEGER PRIMARY KEY, nodeno INTEGER",
+            "CREATE TABLE IF NOT EXISTS {} (rowid INTEGER PRIMARY KEY, nodeno INTEGER",
             self.shadow_rowid_table()
         );
         for name in &self.aux_columns {
             rowid_sql.push_str(&format!(", {} TEXT", quote_sql_ident(name)));
         }
         rowid_sql.push(')');
-        conn.execute(&rowid_sql, &[])
-            .map_err(|_| ResultCode::Error)?;
+        conn.execute(&rowid_sql, &[]).map_err(|e| {
+            eprintln!("rtree: shadow rowid CREATE failed: {:?}", e);
+            ResultCode::Error
+        })?;
 
         let parent_sql = format!(
-            "CREATE TABLE {} (nodeno INTEGER PRIMARY KEY, parentnode INTEGER)",
+            "CREATE TABLE IF NOT EXISTS {} (nodeno INTEGER PRIMARY KEY, parentnode INTEGER)",
             self.shadow_parent_table()
         );
-        conn.execute(&parent_sql, &[])
-            .map_err(|_| ResultCode::Error)?;
+        conn.execute(&parent_sql, &[]).map_err(|e| {
+            eprintln!("rtree: shadow parent CREATE failed: {:?}", e);
+            ResultCode::Error
+        })?;
 
         let mut root_node = RtreeNode::new(1, 0, self.node_size);
         root_node.set_depth(0);

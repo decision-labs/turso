@@ -3324,7 +3324,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_rtree"
-version = "0.7.0-pre.7"
+version = "0.7.0"
 dependencies = [
  "mimalloc",
  "turso_ext",
